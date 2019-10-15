@@ -1,17 +1,17 @@
 .. _capi:
 
-=====
-C API
-=====
+=========
+C/C++ API
+=========
 
 The libopenmc shared library that is built when installing OpenMC exports a
 number of C interoperable functions and global variables that can be used for
-in-memory coupling. While it is possible to directly use the C API as documented
-here for coupling, most advanced users will find it easier to work with the
-Python bindings in the :py:mod:`openmc.capi` module.
+in-memory coupling. While it is possible to directly use the C/C++ API as
+documented here for coupling, most advanced users will find it easier to work
+with the Python bindings in the :py:mod:`openmc.lib` module.
 
-.. warning:: The C API is still experimental and may undergo substantial changes
-             in future releases.
+.. warning:: The C/C++ API is still experimental and may undergo substantial
+             changes in future releases.
 
 ----------------
 Type Definitions
@@ -70,6 +70,17 @@ Functions
 
    :param int32_t index: Index in the cells array
    :param int32_t* id: ID of the cell
+   :return: Return status (negative if an error occurred)
+   :rtype: int
+
+.. c:function:: int openmc_cell_get_temperature(int32_t index, const int32_t* instance, double* T)
+
+   Get the temperature of a cell
+
+   :param int32_t index: Index in the cells array
+   :param int32_t* instance: Which instance of the cell. If a null pointer is passed, the temperature
+                             of the first instance is returned.
+   :param double* T: temperature of the cell
    :return: Return status (negative if an error occurred)
    :rtype: int
 
@@ -321,6 +332,15 @@ Functions
    :param int** nuclides: Pointer to array of nuclide indices
    :param double** densities: Pointer to the array of densities
    :param int* n: Length of the array
+   :return: Return status (negative if an error occurs)
+   :rtype: int
+
+.. c:function:: int openmc_material_get_density(int32_t index, double* density)
+
+   Get density of a material.
+
+   :param int32_t index: Index in the materials array
+   :param double* denity: Pointer to a density
    :return: Return status (negative if an error occurs)
    :rtype: int
 

@@ -1,16 +1,22 @@
+
 #include "openmc/cell.h"
 
+#include <cctype>
 #include <cmath>
 #include <sstream>
+#include <set>
 #include <string>
+#include <gsl/gsl>
 
 #include "openmc/capi.h"
 #include "openmc/constants.h"
+#include "openmc/dagmc.h"
 #include "openmc/error.h"
 #include "openmc/geometry.h"
 #include "openmc/hdf5_interface.h"
 #include "openmc/lattice.h"
 #include "openmc/material.h"
+#include "openmc/nuclide.h"
 #include "openmc/settings.h"
 #include "openmc/surface.h"
 #include "openmc/xml_interface.h"
@@ -22,13 +28,11 @@ namespace openmc {
 //==============================================================================
 
 namespace model {
+  std::vector<std::unique_ptr<Cell>> cells;
+  std::unordered_map<int32_t, int32_t> cell_map;
 
-std::vector<Cell*> cells;
-std::unordered_map<int32_t, int32_t> cell_map;
-
-std::vector<Universe*> universes;
-std::unordered_map<int32_t, int32_t> universe_map;
-
+  std::vector<std::unique_ptr<Universe>> universes;
+  std::unordered_map<int32_t, int32_t> universe_map;
 } // namespace model
 
 //==============================================================================
@@ -116,7 +120,6 @@ generate_rpn(int32_t cell_id, std::vector<int32_t> infix)
     if (token < OP_UNION) {
       // If token is not an operator, add it to output
       rpn.push_back(token);
-
     } else if (token < OP_RIGHT_PAREN) {
       // Regular operators union, intersection, complement
       while (stack.size() > 0) {
@@ -156,7 +159,6 @@ generate_rpn(int32_t cell_id, std::vector<int32_t> infix)
                   << cell_id;
           fatal_error(err_msg);
         }
-
         rpn.push_back(stack.back());
         stack.pop_back();
       }
@@ -206,8 +208,64 @@ Universe::to_hdf5(hid_t universes_group) const
   close_group(group);
 }
 
+BoundingBox Universe::bounding_box() const {
+  BoundingBox bbox = {INFTY, -INFTY, INFTY, -INFTY, INFTY, -INFTY};
+  if (cells_.size() == 0) {
+    return {};
+  } else {
+    for (const auto& cell : cells_) {
+      auto& c = model::cells[cell];
+      bbox |= c->bounding_box();
+    }
+  }
+  return bbox;
+}
+
 //==============================================================================
 // Cell implementation
+//==============================================================================
+
+double
+Cell::temperature(int32_t instance) const
+{
+  if (sqrtkT_.size() < 1) {
+    throw std::runtime_error{"Cell temperature has not yet been set."};
+  }
+
+  if (instance >= 0) {
+    double sqrtkT = sqrtkT_.size() == 1 ?
+      sqrtkT_.at(0) :
+      sqrtkT_.at(instance);
+    return sqrtkT * sqrtkT / K_BOLTZMANN;
+  } else {
+    return sqrtkT_[0] * sqrtkT_[0] / K_BOLTZMANN;
+  }
+}
+
+void
+Cell::set_temperature(double T, int32_t instance)
+{
+  if (settings::temperature_method == TEMPERATURE_INTERPOLATION) {
+    if (T < data::temperature_min) {
+      throw std::runtime_error{"Temperature is below minimum temperature at "
+        "which data is available."};
+    } else if (T > data::temperature_max) {
+      throw std::runtime_error{"Temperature is above maximum temperature at "
+        "which data is available."};
+    }
+  }
+
+  if (instance >= 0) {
+    sqrtkT_.at(instance) = std::sqrt(K_BOLTZMANN * T);
+  } else {
+    for (auto& T_ : sqrtkT_) {
+      T_ = std::sqrt(K_BOLTZMANN * T);
+    }
+  }
+}
+
+//==============================================================================
+// CSGCell implementation
 //==============================================================================
 
 CSGCell::CSGCell() {} // empty constructor
@@ -327,7 +385,6 @@ CSGCell::CSGCell(pugi::xml_node cell_node)
 
   // Convert the infix region spec to RPN.
   rpn_ = generate_rpn(id_, region_);
-  rpn_.shrink_to_fit();
 
   // Check if this is a simple cell.
   simple_ = true;
@@ -337,6 +394,21 @@ CSGCell::CSGCell(pugi::xml_node cell_node)
       break;
     }
   }
+
+  // If this cell is simple, remove all the superfluous operator tokens.
+  if (simple_) {
+    size_t i0 = 0;
+    size_t i1 = 0;
+    while (i1 < rpn_.size()) {
+      if (rpn_[i1] < OP_UNION) {
+        rpn_[i0] = rpn_[i1];
+        ++i0;
+      }
+      ++i1;
+    }
+    rpn_.resize(i0);
+  }
+  rpn_.shrink_to_fit();
 
   // Read the translation vector.
   if (check_for_node(cell_node, "translation")) {
@@ -518,25 +590,120 @@ CSGCell::to_hdf5(hid_t cell_group) const
   close_group(group);
 }
 
+BoundingBox CSGCell::bounding_box_simple() const {
+  BoundingBox bbox;
+  for (int32_t token : rpn_) {
+    bbox &= model::surfaces[abs(token)-1]->bounding_box(token > 0);
+  }
+  return bbox;
+}
+
+void CSGCell::apply_demorgan(std::vector<int32_t>::iterator start,
+                             std::vector<int32_t>::iterator stop)
+{
+  while (start < stop) {
+    if (*start < OP_UNION) { *start *= -1; }
+    else if (*start == OP_UNION) { *start = OP_INTERSECTION; }
+    else if (*start == OP_INTERSECTION) { *start = OP_UNION; }
+    start++;
+  }
+}
+
+std::vector<int32_t>::iterator
+CSGCell::find_left_parenthesis(std::vector<int32_t>::iterator start,
+                               const std::vector<int32_t>& rpn) {
+  // start search at zero
+  int parenthesis_level = 0;
+  auto it = start;
+  while (it != rpn.begin()) {
+    // look at two tokens at a time
+    int32_t one = *it;
+    int32_t two = *(it - 1);
+
+    // decrement parenthesis level if there are two adjacent surfaces
+    if (one < OP_UNION && two < OP_UNION) {
+      parenthesis_level--;
+    // increment if there are two adjacent operators
+    } else if (one >= OP_UNION && two >= OP_UNION) {
+      parenthesis_level++;
+    }
+
+    // if the level gets to zero, return the position
+    if (parenthesis_level == 0) {
+      // move the iterator back one before leaving the loop
+      // so that all tokens in the parenthesis block are included
+      it--;
+      break;
+    }
+
+    // continue loop, one token at a time
+    it--;
+  }
+  return it;
+}
+
+void CSGCell::remove_complement_ops(std::vector<int32_t>& rpn) {
+  auto it = std::find(rpn.begin(), rpn.end(), OP_COMPLEMENT);
+  while (it != rpn.end()) {
+    // find the opening parenthesis (if any)
+    auto left = find_left_parenthesis(it, rpn);
+    std::vector<int32_t> tmp(left, it+1);
+
+    // apply DeMorgan's law to any surfaces/operators between these
+    // positions in the RPN
+    apply_demorgan(left, it);
+    // remove complement operator
+    rpn.erase(it);
+    // update iterator position
+    it = std::find(rpn.begin(), rpn.end(), OP_COMPLEMENT);
+  }
+}
+
+BoundingBox CSGCell::bounding_box_complex(std::vector<int32_t> rpn) {
+  // remove complements by adjusting surface signs and operators
+  remove_complement_ops(rpn);
+
+  std::vector<BoundingBox> stack(rpn.size());
+  int i_stack = -1;
+
+  for (auto& token : rpn) {
+    if (token == OP_UNION) {
+      stack[i_stack - 1] = stack[i_stack - 1] | stack[i_stack];
+      i_stack--;
+    } else if (token == OP_INTERSECTION) {
+      stack[i_stack - 1] = stack[i_stack - 1] & stack[i_stack];
+      i_stack--;
+    } else {
+      i_stack++;
+      stack[i_stack] = model::surfaces[abs(token) - 1]->bounding_box(token > 0);
+    }
+  }
+
+  Ensures(i_stack == 0);
+  return stack.front();
+}
+
+BoundingBox CSGCell::bounding_box() const {
+  return simple_ ? bounding_box_simple() : bounding_box_complex(rpn_);
+}
+
 //==============================================================================
 
 bool
 CSGCell::contains_simple(Position r, Direction u, int32_t on_surface) const
 {
   for (int32_t token : rpn_) {
-    if (token < OP_UNION) {
-      // If the token is not an operator, evaluate the sense of particle with
-      // respect to the surface and see if the token matches the sense. If the
-      // particle's surface attribute is set and matches the token, that
-      // overrides the determination based on sense().
-      if (token == on_surface) {
-      } else if (-token == on_surface) {
-        return false;
-      } else {
-        // Note the off-by-one indexing
-        bool sense = model::surfaces[abs(token)-1]->sense(r, u);
-        if (sense != (token > 0)) {return false;}
-      }
+    // Assume that no tokens are operators. Evaluate the sense of particle with
+    // respect to the surface and see if the token matches the sense. If the
+    // particle's surface attribute is set and matches the token, that
+    // overrides the determination based on sense().
+    if (token == on_surface) {
+    } else if (-token == on_surface) {
+      return false;
+    } else {
+      // Note the off-by-one indexing
+      bool sense = model::surfaces[abs(token)-1]->sense(r, u);
+      if (sense != (token > 0)) {return false;}
     }
   }
   return true;
@@ -549,7 +716,7 @@ CSGCell::contains_complex(Position r, Direction u, int32_t on_surface) const
 {
   // Make a stack of booleans.  We don't know how big it needs to be, but we do
   // know that rpn.size() is an upper-bound.
-  bool stack[rpn_.size()];
+  std::vector<bool> stack(rpn_.size());
   int i_stack = -1;
 
   for (int32_t token : rpn_) {
@@ -602,19 +769,28 @@ DAGCell::DAGCell() : Cell{} {};
 std::pair<double, int32_t>
 DAGCell::distance(Position r, Direction u, int32_t on_surface) const
 {
+  // if we've changed direction or we're not on a surface,
+  // reset the history and update last direction
+  if (u != simulation::last_dir || on_surface == 0) {
+    simulation::history.reset();
+    simulation::last_dir = u;
+  }
+
   moab::ErrorCode rval;
-  moab::EntityHandle vol = dagmc_ptr_->entity_by_id(3, id_);
+  moab::EntityHandle vol = dagmc_ptr_->entity_by_index(3, dag_index_);
   moab::EntityHandle hit_surf;
   double dist;
   double pnt[3] = {r.x, r.y, r.z};
   double dir[3] = {u.x, u.y, u.z};
-  rval = dagmc_ptr_->ray_fire(vol, pnt, dir, hit_surf, dist);
+  rval = dagmc_ptr_->ray_fire(vol, pnt, dir, hit_surf, dist, &simulation::history);
   MB_CHK_ERR_CONT(rval);
   int surf_idx;
   if (hit_surf != 0) {
     surf_idx = dagmc_ptr_->index_by_handle(hit_surf);
-  } else {  // indicate that particle is lost
+  } else {
+    // indicate that particle is lost
     surf_idx = -1;
+    dist = INFINITY;
   }
 
   return {dist, surf_idx};
@@ -623,7 +799,7 @@ DAGCell::distance(Position r, Direction u, int32_t on_surface) const
 bool DAGCell::contains(Position r, Direction u, int32_t on_surface) const
 {
   moab::ErrorCode rval;
-  moab::EntityHandle vol = dagmc_ptr_->entity_by_id(3, id_);
+  moab::EntityHandle vol = dagmc_ptr_->entity_by_index(3, dag_index_);
 
   int result = 0;
   double pnt[3] = {r.x, r.y, r.z};
@@ -635,7 +811,160 @@ bool DAGCell::contains(Position r, Direction u, int32_t on_surface) const
 
 void DAGCell::to_hdf5(hid_t group_id) const { return; }
 
+BoundingBox DAGCell::bounding_box() const
+{
+  moab::ErrorCode rval;
+  moab::EntityHandle vol = dagmc_ptr_->entity_by_index(3, dag_index_);
+  double min[3], max[3];
+  rval = dagmc_ptr_->getobb(vol, min, max);
+  MB_CHK_ERR_CONT(rval);
+  return {min[0], max[0], min[1], max[1], min[2], max[2]};
+}
+
 #endif
+
+//==============================================================================
+// UniversePartitioner implementation
+//==============================================================================
+
+UniversePartitioner::UniversePartitioner(const Universe& univ)
+{
+  // Define an ordered set of surface indices that point to z-planes.  Use a
+  // functor to to order the set by the z0_ values of the corresponding planes.
+  struct compare_surfs {
+    bool operator()(const int32_t& i_surf, const int32_t& j_surf) const
+    {
+      const auto* surf = model::surfaces[i_surf].get();
+      const auto* zplane = dynamic_cast<const SurfaceZPlane*>(surf);
+      double zi = zplane->z0_;
+      surf = model::surfaces[j_surf].get();
+      zplane = dynamic_cast<const SurfaceZPlane*>(surf);
+      double zj = zplane->z0_;
+      return zi < zj;
+    }
+  };
+  std::set<int32_t, compare_surfs> surf_set;
+
+  // Find all of the z-planes in this universe.  A set is used here for the
+  // O(log(n)) insertions that will ensure entries are not repeated.
+  for (auto i_cell : univ.cells_) {
+    for (auto token : model::cells[i_cell]->rpn_) {
+      if (token < OP_UNION) {
+        auto i_surf = std::abs(token) - 1;
+        const auto* surf = model::surfaces[i_surf].get();
+        if (const auto* zplane = dynamic_cast<const SurfaceZPlane*>(surf))
+          surf_set.insert(i_surf);
+      }
+    }
+  }
+
+  // Populate the surfs_ vector from the ordered set.
+  surfs_.insert(surfs_.begin(), surf_set.begin(), surf_set.end());
+
+  // Populate the partition lists.
+  partitions_.resize(surfs_.size() + 1);
+  for (auto i_cell : univ.cells_) {
+    // It is difficult to determine the bounds of a complex cell, so add complex
+    // cells to all partitions.
+    if (!model::cells[i_cell]->simple_) {
+      for (auto& p : partitions_) p.push_back(i_cell);
+      continue;
+    }
+
+    // Find the tokens for bounding z-planes.
+    int32_t lower_token = 0, upper_token = 0;
+    double min_z, max_z;
+    for (auto token : model::cells[i_cell]->rpn_) {
+      if (token < OP_UNION) {
+        const auto* surf = model::surfaces[std::abs(token) - 1].get();
+        if (const auto* zplane = dynamic_cast<const SurfaceZPlane*>(surf)) {
+          if (lower_token == 0 || zplane->z0_ < min_z) {
+            lower_token = token;
+            min_z = zplane->z0_;
+          }
+          if (upper_token == 0 || zplane->z0_ > max_z) {
+            upper_token = token;
+            max_z = zplane->z0_;
+          }
+        }
+      }
+    }
+
+    // If there are no bounding z-planes, add this cell to all partitions.
+    if (lower_token == 0) {
+      for (auto& p : partitions_) p.push_back(i_cell);
+      continue;
+    }
+
+    // Find the first partition this cell lies in.  If the lower_token indicates
+    // a negative halfspace, then the cell is unbounded in the lower direction
+    // and it lies in the first partition onward.  Otherwise, it is bounded by
+    // the positive halfspace given by the lower_token.
+    int first_partition = 0;
+    if (lower_token > 0) {
+      for (int i = 0; i < surfs_.size(); ++i) {
+        if (lower_token == surfs_[i] + 1) {
+          first_partition = i + 1;
+          break;
+        }
+      }
+    }
+
+    // Find the last partition this cell lies in.  The logic is analogous to the
+    // logic for first_partition.
+    int last_partition = surfs_.size();
+    if (upper_token < 0) {
+      for (int i = first_partition; i < surfs_.size(); ++i) {
+        if (upper_token == -(surfs_[i] + 1)) {
+          last_partition = i;
+          break;
+        }
+      }
+    }
+
+    // Add the cell to all relevant partitions.
+    for (int i = first_partition; i <= last_partition; ++i) {
+      partitions_[i].push_back(i_cell);
+    }
+  }
+}
+
+const std::vector<int32_t>&
+UniversePartitioner::get_cells(Position r, Direction u) const
+{
+  // Perform a binary search for the partition containing the given coordinates.
+  int left = 0;
+  int middle = (surfs_.size() - 1) / 2;
+  int right = surfs_.size() - 1;
+  while (true) {
+    // Check the sense of the coordinates for the current surface.
+    const auto& surf = *model::surfaces[surfs_[middle]];
+    if (surf.sense(r, u)) {
+      // The coordinates lie in the positive halfspace.  Recurse if there are
+      // more surfaces to check.  Otherwise, return the cells on the positive
+      // side of this surface.
+      int right_leaf = right - (right - middle) / 2;
+      if (right_leaf != middle) {
+        left = middle + 1;
+        middle = right_leaf;
+      } else {
+        return partitions_[middle+1];
+      }
+
+    } else {
+      // The coordinates lie in the negative halfspace.  Recurse if there are
+      // more surfaces to check.  Otherwise, return the cells on the negative
+      // side of this surface.
+      int left_leaf = left + (middle - left) / 2;
+      if (left_leaf != middle) {
+        right = middle-1;
+        middle = left_leaf;
+      } else {
+        return partitions_[middle];
+      }
+    }
+  }
+}
 
 //==============================================================================
 // Non-method functions
@@ -653,7 +982,7 @@ void read_cells(pugi::xml_node node)
   // Loop over XML cell elements and populate the array.
   model::cells.reserve(n_cells);
   for (pugi::xml_node cell_node : node.children("cell")) {
-    model::cells.push_back(new CSGCell(cell_node));
+    model::cells.push_back(std::make_unique<CSGCell>(cell_node));
   }
 
   // Fill the cell map.
@@ -674,7 +1003,7 @@ void read_cells(pugi::xml_node node)
     int32_t uid = model::cells[i]->universe_;
     auto it = model::universe_map.find(uid);
     if (it == model::universe_map.end()) {
-      model::universes.push_back(new Universe());
+      model::universes.push_back(std::make_unique<Universe>());
       model::universes.back()->id_ = uid;
       model::universes.back()->cells_.push_back(i);
       model::universe_map[uid] = model::universes.size() - 1;
@@ -727,9 +1056,8 @@ openmc_cell_set_fill(int32_t index, int type, int32_t n,
         int i_mat = indices[i];
         if (i_mat == MATERIAL_VOID) {
           c.material_.push_back(MATERIAL_VOID);
-        } else if (i_mat >= 1 && i_mat <= model::materials.size()) {
-          //TODO: off-by-one
-          c.material_.push_back(i_mat - 1);
+        } else if (i_mat >= 0 && i_mat < model::materials.size()) {
+          c.material_.push_back(i_mat);
         } else {
           set_errmsg("Index in materials array is out of bounds.");
           return OPENMC_E_OUT_OF_BOUNDS;
@@ -748,33 +1076,90 @@ openmc_cell_set_fill(int32_t index, int type, int32_t n,
   return 0;
 }
 
-//TODO: make sure data is loaded for this temperature
 extern "C" int
 openmc_cell_set_temperature(int32_t index, double T, const int32_t* instance)
 {
-  if (index >= 0 && index < model::cells.size()) {
-    Cell& c {*model::cells[index]};
-
-    if (instance) {
-      if (*instance >= 0 && *instance < c.sqrtkT_.size()) {
-        c.sqrtkT_[*instance] = std::sqrt(K_BOLTZMANN * T);
-      } else {
-        strcpy(openmc_err_msg, "Distribcell instance is out of bounds.");
-        return OPENMC_E_OUT_OF_BOUNDS;
-      }
-    } else {
-      for (auto& T_ : c.sqrtkT_) {
-        T_ = std::sqrt(K_BOLTZMANN * T);
-      }
-    }
-
-  } else {
+  if (index < 0 || index >= model::cells.size()) {
     strcpy(openmc_err_msg, "Index in cells array is out of bounds.");
     return OPENMC_E_OUT_OF_BOUNDS;
   }
 
+  int32_t instance_index = instance ? *instance : -1;
+  try {
+    model::cells[index]->set_temperature(T, instance_index);
+  } catch (const std::exception& e) {
+    set_errmsg(e.what());
+    return OPENMC_E_UNASSIGNED;
+  }
   return 0;
 }
+
+extern "C" int
+openmc_cell_get_temperature(int32_t index, const int32_t* instance, double* T)
+{
+  if (index < 0 || index >= model::cells.size()) {
+    strcpy(openmc_err_msg, "Index in cells array is out of bounds.");
+    return OPENMC_E_OUT_OF_BOUNDS;
+  }
+
+  int32_t instance_index = instance ? *instance : -1;
+  try {
+    *T = model::cells[index]->temperature(instance_index);
+  } catch (const std::exception& e) {
+    set_errmsg(e.what());
+    return OPENMC_E_UNASSIGNED;
+  }
+  return 0;
+}
+
+//! Get the bounding box of a cell
+extern "C" int
+openmc_cell_bounding_box(const int32_t index, double* llc, double* urc) {
+
+  BoundingBox bbox;
+
+  const auto& c = model::cells[index];
+  bbox = c->bounding_box();
+
+  // set lower left corner values
+  llc[0] = bbox.xmin;
+  llc[1] = bbox.ymin;
+  llc[2] = bbox.zmin;
+
+  // set upper right corner values
+  urc[0] = bbox.xmax;
+  urc[1] = bbox.ymax;
+  urc[2] = bbox.zmax;
+
+  return 0;
+}
+
+//! Get the name of a cell
+extern "C" int
+openmc_cell_get_name(int32_t index, const char** name) {
+  if (index < 0 || index >= model::cells.size()) {
+    set_errmsg("Index in cells array is out of bounds.");
+    return OPENMC_E_OUT_OF_BOUNDS;
+  }
+
+  *name = model::cells[index]->name().data();
+
+  return 0;
+}
+
+//! Set the name of a cell
+extern "C" int
+openmc_cell_set_name(int32_t index, const char* name) {
+  if (index < 0 || index >= model::cells.size()) {
+    set_errmsg("Index in cells array is out of bounds.");
+    return OPENMC_E_OUT_OF_BOUNDS;
+  }
+
+  model::cells[index]->set_name(name);
+
+  return 0;
+}
+
 
 //! Return the index in the cells array of a cell with a given ID
 extern "C" int
@@ -824,7 +1209,7 @@ openmc_extend_cells(int32_t n, int32_t* index_start, int32_t* index_end)
   if (index_start) *index_start = model::cells.size();
   if (index_end) *index_end = model::cells.size() + n - 1;
   for (int32_t i = 0; i < n; i++) {
-    model::cells.push_back(new CSGCell());
+    model::cells.push_back(std::make_unique<CSGCell>());
   }
   return 0;
 }
@@ -833,9 +1218,9 @@ openmc_extend_cells(int32_t n, int32_t* index_start, int32_t* index_end)
 int32_t next_cell(DAGCell* cur_cell, DAGSurface* surf_xed)
 {
   moab::EntityHandle surf =
-    surf_xed->dagmc_ptr_->entity_by_id(2, surf_xed->id_);
+    surf_xed->dagmc_ptr_->entity_by_index(2, surf_xed->dag_index_);
   moab::EntityHandle vol =
-    cur_cell->dagmc_ptr_->entity_by_id(3, cur_cell->id_);
+    cur_cell->dagmc_ptr_->entity_by_index(3, cur_cell->dag_index_);
 
   moab::EntityHandle new_vol;
   cur_cell->dagmc_ptr_->next_vol(surf, vol, new_vol);

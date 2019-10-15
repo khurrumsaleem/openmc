@@ -3,6 +3,7 @@
 
 #include <vector>
 
+#include "openmc/particle.h"
 #include "openmc/tallies/filter.h"
 
 namespace openmc {
@@ -14,7 +15,13 @@ namespace openmc {
 class ParticleFilter : public Filter
 {
 public:
+  //----------------------------------------------------------------------------
+  // Constructors, destructors
+
   ~ParticleFilter() = default;
+
+  //----------------------------------------------------------------------------
+  // Methods
 
   std::string type() const override {return "particle";}
 
@@ -27,7 +34,18 @@ public:
 
   std::string text_label(int bin) const override;
 
-  std::vector<int> particles_;
+  //----------------------------------------------------------------------------
+  // Accessors
+
+  const std::vector<Particle::Type>& particles() const { return particles_; }
+
+  void set_particles(gsl::span<Particle::Type> particles);
+
+private:
+  //----------------------------------------------------------------------------
+  // Data members
+
+  std::vector<Particle::Type> particles_;
 };
 
 } // namespace openmc

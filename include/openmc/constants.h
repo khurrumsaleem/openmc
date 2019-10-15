@@ -20,12 +20,13 @@ using double_4dvec = std::vector<std::vector<std::vector<std::vector<double>>>>;
 
 // OpenMC major, minor, and release numbers
 constexpr int VERSION_MAJOR {0};
-constexpr int VERSION_MINOR {10};
+constexpr int VERSION_MINOR {12};
 constexpr int VERSION_RELEASE {0};
+constexpr bool VERSION_DEV {true};
 constexpr std::array<int, 3> VERSION {VERSION_MAJOR, VERSION_MINOR, VERSION_RELEASE};
 
 // HDF5 data format
-constexpr int HDF5_VERSION[] {2, 0};
+constexpr int HDF5_VERSION[] {3, 0};
 
 // Version numbers for binary files
 constexpr std::array<int, 2> VERSION_STATEPOINT {17, 0};
@@ -33,9 +34,8 @@ constexpr std::array<int, 2> VERSION_PARTICLE_RESTART {2, 0};
 constexpr std::array<int, 2> VERSION_TRACK {2, 0};
 constexpr std::array<int, 2> VERSION_SUMMARY {6, 0};
 constexpr std::array<int, 2> VERSION_VOLUME {1, 0};
-constexpr std::array<int, 2> VERSION_VOXEL {1, 0};
+constexpr std::array<int, 2> VERSION_VOXEL {2, 0};
 constexpr std::array<int, 2> VERSION_MGXS_LIBRARY {1, 0};
-constexpr char VERSION_MULTIPOLE[] {"v0.2"};
 
 // ============================================================================
 // ADJUSTABLE PARAMETERS
@@ -105,9 +105,10 @@ constexpr std::array<const char*, 39> SUBSHELLS =  {
   "Q1", "Q2", "Q3"
 };
 
-// Void material
+// Void material and nuclide
 // TODO: refactor and remove
 constexpr int MATERIAL_VOID {-1};
+constexpr int NUCLIDE_NONE  {-1};
 
 // ============================================================================
 // CROSS SECTION RELATED CONSTANTS
@@ -127,6 +128,7 @@ constexpr int TEMPERATURE_INTERPOLATION {2};
 
 // Reaction types
 // TODO: Convert to enum
+constexpr int REACTION_NONE {0};
 constexpr int TOTAL_XS {1};
 constexpr int ELASTIC {2};
 constexpr int N_NONELASTIC {3};
@@ -225,6 +227,13 @@ constexpr int N_3P    {197};
 constexpr int N_N3P   {198};
 constexpr int N_3N2PA {199};
 constexpr int N_5N2P  {200};
+constexpr int N_XP    {203};
+constexpr int N_XD    {204};
+constexpr int N_XT    {205};
+constexpr int N_X3HE  {206};
+constexpr int N_XA    {207};
+constexpr int HEATING {301};
+constexpr int DAMAGE_ENERGY {444};
 constexpr int COHERENT {502};
 constexpr int INCOHERENT {504};
 constexpr int PAIR_PROD_ELEC {515};
@@ -243,6 +252,7 @@ constexpr int N_A0    {800};
 constexpr int N_AC    {849};
 constexpr int N_2N0   {875};
 constexpr int N_2NC   {891};
+constexpr int HEATING_LOCAL {901};
 
 constexpr std::array<int, 6> DEPLETION_RX {N_GAMMA, N_P, N_A, N_2N, N_3N, N_4N};
 
@@ -337,6 +347,7 @@ constexpr int ESTIMATOR_COLLISION   {3};
 // TODO: Convert to enum
 constexpr int EVENT_SURFACE {-2};
 constexpr int EVENT_LATTICE {-1};
+constexpr int EVENT_KILL    {0};
 constexpr int EVENT_SCATTER {1};
 constexpr int EVENT_ABSORB  {2};
 
@@ -396,8 +407,6 @@ constexpr int LEAKAGE       {3};
 // Miscellaneous
 constexpr int C_NONE {-1};
 constexpr int F90_NONE {0}; //TODO: replace usage of this with C_NONE
-constexpr int ERROR_INT {-2147483647}; // TODO: use <numeric_limits> when F90
-                                       // interop is gone
 
 // Interpolation rules
 enum class Interpolation {

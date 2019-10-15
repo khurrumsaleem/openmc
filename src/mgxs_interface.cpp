@@ -136,7 +136,7 @@ void create_macro_xs()
   for (int i = 0; i < model::materials.size(); ++i) {
     if (kTs[i].size() > 0) {
       // Convert atom_densities to a vector
-      Material* mat = model::materials[i];
+      auto& mat {model::materials[i]};
       std::vector<double> atom_densities(mat->atom_density_.begin(),
         mat->atom_density_.end());
 
@@ -235,7 +235,7 @@ void read_mg_cross_sections_header()
   }
 
   // Get the minimum and maximum energies
-  int neutron = static_cast<int>(ParticleType::neutron);
+  int neutron = static_cast<int>(Particle::Type::neutron);
   data::energy_min[neutron] = data::energy_bins.back();
   data::energy_max[neutron] = data::energy_bins.front();
 
@@ -248,10 +248,10 @@ void read_mg_cross_sections_header()
 //==============================================================================
 
 void
-calculate_xs_c(int i_mat, int gin, double sqrtkT, const double uvw[3],
+calculate_xs_c(int i_mat, int gin, double sqrtkT, Direction u,
      double& total_xs, double& abs_xs, double& nu_fiss_xs)
 {
-  data::macro_xs[i_mat - 1].calculate_xs(gin - 1, sqrtkT, uvw, total_xs, abs_xs,
+  data::macro_xs[i_mat].calculate_xs(gin - 1, sqrtkT, u, total_xs, abs_xs,
        nu_fiss_xs);
 }
 
@@ -263,21 +263,13 @@ get_nuclide_xs(int index, int xstype, int gin, const int* gout,
 {
   int gout_c;
   const int* gout_c_p;
-  int dg_c;
-  const int* dg_c_p;
   if (gout != nullptr) {
     gout_c = *gout - 1;
     gout_c_p = &gout_c;
   } else {
     gout_c_p = gout;
   }
-  if (dg != nullptr) {
-    dg_c = *dg - 1;
-    dg_c_p = &dg_c;
-  } else {
-    dg_c_p = dg;
-  }
-  return data::nuclides_MG[index - 1].get_xs(xstype, gin - 1, gout_c_p, mu, dg_c_p);
+  return data::nuclides_MG[index].get_xs(xstype, gin - 1, gout_c_p, mu, dg);
 }
 
 //==============================================================================
@@ -288,21 +280,13 @@ get_macro_xs(int index, int xstype, int gin, const int* gout,
 {
   int gout_c;
   const int* gout_c_p;
-  int dg_c;
-  const int* dg_c_p;
   if (gout != nullptr) {
     gout_c = *gout - 1;
     gout_c_p = &gout_c;
   } else {
     gout_c_p = gout;
   }
-  if (dg != nullptr) {
-    dg_c = *dg - 1;
-    dg_c_p = &dg_c;
-  } else {
-    dg_c_p = dg;
-  }
-  return data::macro_xs[index - 1].get_xs(xstype, gin - 1, gout_c_p, mu, dg_c_p);
+  return data::macro_xs[index].get_xs(xstype, gin - 1, gout_c_p, mu, dg);
 }
 
 //==============================================================================

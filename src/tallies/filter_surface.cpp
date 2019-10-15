@@ -11,41 +11,51 @@ namespace openmc {
 void
 SurfaceFilter::from_xml(pugi::xml_node node)
 {
-  surfaces_ = get_node_array<int32_t>(node, "bins");
-  n_bins_ = surfaces_.size();
-}
+  auto surfaces = get_node_array<int32_t>(node, "bins");
 
-void
-SurfaceFilter::initialize()
-{
-  // Convert surface IDs to indices of the global array.
-  for (auto& s : surfaces_) {
+  // Convert surface IDs to indices of the global surfaces vector.
+  for (auto& s : surfaces) {
     auto search = model::surface_map.find(s);
-    if (search != model::surface_map.end()) {
-      s = search->second;
-    } else {
+    if (search == model::surface_map.end()) {
       std::stringstream err_msg;
       err_msg << "Could not find surface " << s
               << " specified on tally filter.";
-      fatal_error(err_msg);
+      throw std::runtime_error{err_msg.str()};
     }
+
+    s = search->second;
   }
 
-  // Populate the index->bin map.
-  for (int i = 0; i < surfaces_.size(); i++) {
-    map_[surfaces_[i]] = i;
+  this->set_surfaces(surfaces);
+}
+
+void
+SurfaceFilter::set_surfaces(gsl::span<int32_t> surfaces)
+{
+  // Clear existing surfaces
+  surfaces_.clear();
+  surfaces_.reserve(surfaces.size());
+  map_.clear();
+
+  // Update surfaces and mapping
+  for (auto& index : surfaces) {
+    Expects(index >= 0);
+    Expects(index < model::surfaces.size());
+    surfaces_.push_back(index);
+    map_[index] = surfaces_.size() - 1;
   }
+
+  n_bins_ = surfaces_.size();
 }
 
 void
 SurfaceFilter::get_all_bins(const Particle* p, int estimator,
                             FilterMatch& match) const
 {
-  auto search = map_.find(std::abs(p->surface)-1);
+  auto search = map_.find(std::abs(p->surface_)-1);
   if (search != map_.end()) {
-    //TODO: off-by-one
-    match.bins_.push_back(search->second + 1);
-    if (p->surface < 0) {
+    match.bins_.push_back(search->second);
+    if (p->surface_ < 0) {
       match.weights_.push_back(-1.0);
     } else {
       match.weights_.push_back(1.0);
@@ -65,8 +75,7 @@ SurfaceFilter::to_statepoint(hid_t filter_group) const
 std::string
 SurfaceFilter::text_label(int bin) const
 {
-  //TODO: off-by-one
-  return "Surface " + std::to_string(model::surfaces[surfaces_[bin-1]]->id_);
+  return "Surface " + std::to_string(model::surfaces[surfaces_[bin]]->id_);
 }
 
 } // namespace openmc

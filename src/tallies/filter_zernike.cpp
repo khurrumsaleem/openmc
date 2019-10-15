@@ -29,18 +29,17 @@ ZernikeFilter::get_all_bins(const Particle* p, int estimator,
                             FilterMatch& match) const
 {
   // Determine the normalized (r,theta) coordinates.
-  double x = p->coord[0].xyz[0] - x_;
-  double y = p->coord[0].xyz[1] - y_;
+  double x = p->r().x - x_;
+  double y = p->r().y - y_;
   double r = std::sqrt(x*x + y*y) / r_;
   double theta = std::atan2(y, x);
 
   if (r <= 1.0) {
     // Compute and return the Zernike weights.
-    double zn[n_bins_];
-    calc_zn(order_, r, theta, zn);
+    std::vector<double> zn(n_bins_);
+    calc_zn(order_, r, theta, zn.data());
     for (int i = 0; i < n_bins_; i++) {
-      //TODO: off-by-one
-      match.bins_.push_back(i+1);
+      match.bins_.push_back(i);
       match.weights_.push_back(zn[i]);
     }
   }
@@ -62,19 +61,22 @@ ZernikeFilter::text_label(int bin) const
   std::stringstream out;
   for (int n = 0; n < order_+1; n++) {
     int last = (n + 1) * (n + 2) / 2;
-    //TODO: off-by-one
-    if (bin <= last) {
-      int first = last - n;
+    if (bin < last) {
+      int first = last - (n + 1);
       int m = -n + (bin - first) * 2;
       out << "Zernike expansion, Z" << n << "," << m;
-      return out.str();
+      break;
     }
   }
+  return out.str();
 }
 
 void
 ZernikeFilter::set_order(int order)
 {
+  if (order < 0) {
+    throw std::invalid_argument{"Zernike order must be non-negative."};
+  }
   order_ = order;
   n_bins_ = ((order+1) * (order+2)) / 2;
 }
@@ -88,17 +90,16 @@ ZernikeRadialFilter::get_all_bins(const Particle* p, int estimator,
                                   FilterMatch& match) const
 {
   // Determine the normalized radius coordinate.
-  double x = p->coord[0].xyz[0] - x_;
-  double y = p->coord[0].xyz[1] - y_;
+  double x = p->r().x - x_;
+  double y = p->r().y - y_;
   double r = std::sqrt(x*x + y*y) / r_;
 
   if (r <= 1.0) {
     // Compute and return the Zernike weights.
-    double zn[n_bins_];
-    calc_zn_rad(order_, r, zn);
+    std::vector<double> zn(n_bins_);
+    calc_zn_rad(order_, r, zn.data());
     for (int i = 0; i < n_bins_; i++) {
-      //TODO: off-by-one
-      match.bins_.push_back(i+1);
+      match.bins_.push_back(i);
       match.weights_.push_back(zn[i]);
     }
   }
@@ -107,14 +108,13 @@ ZernikeRadialFilter::get_all_bins(const Particle* p, int estimator,
 std::string
 ZernikeRadialFilter::text_label(int bin) const
 {
-  //TODO: off-by-one
-  return "Zernike expansion, Z" + std::to_string(2*(bin-1)) + ",0";
+  return "Zernike expansion, Z" + std::to_string(2*bin) + ",0";
 }
 
 void
 ZernikeRadialFilter::set_order(int order)
 {
-  order_ = order;
+  ZernikeFilter::set_order(order);
   n_bins_ = order / 2 + 1;
 }
 
@@ -132,7 +132,7 @@ check_zernike_filter(int32_t index)
   }
 
   // Get a pointer to the filter and downcast.
-  const auto& filt_base = model::tally_filters[index-1].get();
+  const auto& filt_base = model::tally_filters[index].get();
   auto* filt = dynamic_cast<ZernikeFilter*>(filt_base);
 
   // Check the filter type.
@@ -168,9 +168,9 @@ openmc_zernike_filter_get_params(int32_t index, double* x, double* y,
   if (err) return err;
 
   // Output the params.
-  *x = filt->x_;
-  *y = filt->y_;
-  *r = filt->r_;
+  *x = filt->x();
+  *y = filt->y();
+  *r = filt->r();
   return 0;
 }
 
@@ -199,9 +199,9 @@ openmc_zernike_filter_set_params(int32_t index, const double* x,
   if (err) return err;
 
   // Update the filter.
-  if (x) filt->x_ = *x;
-  if (y) filt->y_ = *y;
-  if (r) filt->r_ = *r;
+  if (x) filt->set_x(*x);
+  if (y) filt->set_y(*y);
+  if (r) filt->set_r(*r);
   return 0;
 }
 

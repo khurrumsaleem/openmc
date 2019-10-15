@@ -1,7 +1,9 @@
 #ifndef OPENMC_POSITION_H
 #define OPENMC_POSITION_H
 
+#include <array>
 #include <cmath> // for sqrt
+#include <iostream>
 #include <stdexcept> // for out_of_range
 #include <vector>
 
@@ -16,7 +18,8 @@ struct Position {
   Position() = default;
   Position(double x_, double y_, double z_) : x{x_}, y{y_}, z{z_} { };
   Position(const double xyz[]) : x{xyz[0]}, y{xyz[1]}, z{xyz[2]} { };
-  Position(const std::vector<double> xyz) : x{xyz[0]}, y{xyz[1]}, z{xyz[2]} { };
+  Position(const std::vector<double>& xyz) : x{xyz[0]}, y{xyz[1]}, z{xyz[2]} { };
+  Position(const std::array<double, 3>& xyz) : x{xyz[0]}, y{xyz[1]}, z{xyz[2]} { };
 
   // Unary operators
   Position& operator+=(Position);
@@ -27,6 +30,7 @@ struct Position {
   Position& operator*=(double);
   Position& operator/=(Position);
   Position& operator/=(double);
+  Position operator-() const;
 
   const double& operator[](int i) const {
     switch (i) {
@@ -52,12 +56,15 @@ struct Position {
   //! Dot product of two vectors
   //! \param[in] other Vector to take dot product with
   //! \result Resulting dot product
-  inline double dot(Position other) {
+  inline double dot(Position other) const {
     return x*other.x + y*other.y + z*other.z;
   }
-  inline double norm() {
+  inline double norm() const {
     return std::sqrt(x*x + y*y + z*z);
   }
+
+  //! Rotate the position based on a rotation matrix
+  Position rotate(const std::vector<double>& rotation) const;
 
   // Data members
   double x = 0.;
@@ -87,6 +94,8 @@ inline bool operator==(Position a, Position b)
 
 inline bool operator!=(Position a, Position b)
 {return a.x != b.x || a.y != b.y || a.z != b.z;}
+
+std::ostream& operator<<(std::ostream& os, Position a);
 
 //==============================================================================
 //! Type representing a vector direction in Cartesian coordinates

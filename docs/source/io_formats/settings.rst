@@ -333,7 +333,7 @@ or sub-elements:
     velocity sampling) or "dbrc" (Doppler broadening rejection correction).
     Descriptions of each of these methods are documented here_.
 
-    .. _here: http://dx.doi.org/10.1016/j.anucene.2017.12.044
+    .. _here: https://doi.org/10.1016/j.anucene.2017.12.044
 
     *Default*: "rvs"
 
@@ -729,15 +729,6 @@ temperature in the range of 325 K to 355 K will be used to evaluate cross
 sections.
 
   *Default*: 10 K
-
----------------------
-``<threads>`` Element
----------------------
-
-The ``<threads>`` element indicates the number of OpenMP threads to be used for
-a simulation. It has no attributes and accepts a positive integer value.
-
-  *Default*: None (Determined by environment variable :envvar:`OMP_NUM_THREADS`)
 
 .. _trace:
 

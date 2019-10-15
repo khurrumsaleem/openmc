@@ -3,15 +3,14 @@
 
 #include <cstdint>
 #include <limits>
+#include <memory> // for unique_ptr
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 #include "hdf5.h"
 #include "pugixml.hpp"
-#ifdef DAGMC
-#include "DagMC.hpp"
-#endif
+#include "dagmc.h"
 
 #include "openmc/constants.h"
 #include "openmc/neighbor_list.h"
@@ -42,17 +41,14 @@ constexpr int32_t OP_UNION        {std::numeric_limits<int32_t>::max() - 4};
 
 class Cell;
 class Universe;
+class UniversePartitioner;
 
 namespace model {
+  extern std::vector<std::unique_ptr<Cell>> cells;
+  extern std::unordered_map<int32_t, int32_t> cell_map;
 
-extern "C" int32_t n_cells;
-
-extern std::vector<Cell*> cells;
-extern std::unordered_map<int32_t, int32_t> cell_map;
-
-extern std::vector<Universe*> universes;
-extern std::unordered_map<int32_t, int32_t> universe_map;
-
+  extern std::vector<std::unique_ptr<Universe>> universes;
+  extern std::unordered_map<int32_t, int32_t> universe_map;
 } // namespace model
 
 //==============================================================================
@@ -68,15 +64,87 @@ public:
   //! \brief Write universe information to an HDF5 group.
   //! \param group_id An HDF5 group id.
   void to_hdf5(hid_t group_id) const;
+
+  BoundingBox bounding_box() const;
+
+  std::unique_ptr<UniversePartitioner> partitioner_;
 };
 
 //==============================================================================
 //! A geometry primitive that links surfaces, universes, and materials
 //==============================================================================
 
-class Cell
-{
+class Cell {
 public:
+  //----------------------------------------------------------------------------
+  // Constructors, destructors, factory functions
+
+  explicit Cell(pugi::xml_node cell_node);
+  Cell() {};
+  virtual ~Cell() = default;
+
+  //----------------------------------------------------------------------------
+  // Methods
+
+  //! \brief Determine if a cell contains the particle at a given location.
+  //!
+  //! The bounds of the cell are detemined by a logical expression involving
+  //! surface half-spaces. At initialization, the expression was converted
+  //! to RPN notation.
+  //!
+  //! The function is split into two cases, one for simple cells (those
+  //! involving only the intersection of half-spaces) and one for complex cells.
+  //! Simple cells can be evaluated with short circuit evaluation, i.e., as soon
+  //! as we know that one half-space is not satisfied, we can exit. This
+  //! provides a performance benefit for the common case. In
+  //! contains_complex, we evaluate the RPN expression using a stack, similar to
+  //! how a RPN calculator would work.
+  //! \param r The 3D Cartesian coordinate to check.
+  //! \param u A direction used to "break ties" the coordinates are very
+  //!   close to a surface.
+  //! \param on_surface The signed index of a surface that the coordinate is
+  //!   known to be on.  This index takes precedence over surface sense
+  //!   calculations.
+  virtual bool
+  contains(Position r, Direction u, int32_t on_surface) const = 0;
+
+  //! Find the oncoming boundary of this cell.
+  virtual std::pair<double, int32_t>
+  distance(Position r, Direction u, int32_t on_surface) const = 0;
+
+  //! Write all information needed to reconstruct the cell to an HDF5 group.
+  //! \param group_id An HDF5 group id.
+  virtual void to_hdf5(hid_t group_id) const = 0;
+
+  //! Get the BoundingBox for this cell.
+  virtual BoundingBox bounding_box() const = 0;
+
+  //----------------------------------------------------------------------------
+  // Accessors
+
+  //! Get the temperature of a cell instance
+  //! \param[in] instance Instance index. If -1 is given, the temperature for
+  //!   the first instance is returned.
+  //! \return Temperature in [K]
+  double temperature(int32_t instance = -1) const;
+
+  //! Set the temperature of a cell instance
+  //! \param[in] T Temperature in [K]
+  //! \param[in] instance Instance index. If -1 is given, the temperature for
+  //!   all instances is set.
+  void set_temperature(double T, int32_t instance = -1);
+
+  //! Get the name of a cell
+  //! \return Cell name
+  const std::string& name() const { return name_; };
+
+  //! Set the temperature of a cell instance
+  //! \param[in] name Cell name
+  void set_name(const std::string& name) { name_ = name; };
+
+  //----------------------------------------------------------------------------
+  // Data members
+
   int32_t id_;                //!< Unique ID
   std::string name_;          //!< User-defined name
   int type_;                  //!< Material, universe, or lattice
@@ -118,41 +186,6 @@ public:
   std::vector<double> rotation_;
 
   std::vector<int32_t> offset_;  //!< Distribcell offset table
-
-  explicit Cell(pugi::xml_node cell_node);
-  Cell() {};
-
-  //! \brief Determine if a cell contains the particle at a given location.
-  //!
-  //! The bounds of the cell are detemined by a logical expression involving
-  //! surface half-spaces. At initialization, the expression was converted
-  //! to RPN notation.
-  //!
-  //! The function is split into two cases, one for simple cells (those
-  //! involving only the intersection of half-spaces) and one for complex cells.
-  //! Simple cells can be evaluated with short circuit evaluation, i.e., as soon
-  //! as we know that one half-space is not satisfied, we can exit. This
-  //! provides a performance benefit for the common case. In
-  //! contains_complex, we evaluate the RPN expression using a stack, similar to
-  //! how a RPN calculator would work.
-  //! \param r The 3D Cartesian coordinate to check.
-  //! \param u A direction used to "break ties" the coordinates are very
-  //!   close to a surface.
-  //! \param on_surface The signed index of a surface that the coordinate is
-  //!   known to be on.  This index takes precedence over surface sense
-  //!   calculations.
-  virtual bool
-  contains(Position r, Direction u, int32_t on_surface) const = 0;
-
-  //! Find the oncoming boundary of this cell.
-  virtual std::pair<double, int32_t>
-  distance(Position r, Direction u, int32_t on_surface) const = 0;
-
-  //! Write all information needed to reconstruct the cell to an HDF5 group.
-  //! @param group_id An HDF5 group id.
-  virtual void to_hdf5(hid_t group_id) const = 0;
-
-  virtual ~Cell() {}
 };
 
 //==============================================================================
@@ -172,9 +205,33 @@ public:
 
   void to_hdf5(hid_t group_id) const;
 
+  BoundingBox bounding_box() const;
+
 protected:
   bool contains_simple(Position r, Direction u, int32_t on_surface) const;
   bool contains_complex(Position r, Direction u, int32_t on_surface) const;
+  BoundingBox bounding_box_simple() const;
+  static BoundingBox bounding_box_complex(std::vector<int32_t> rpn);
+
+  //! Applies DeMorgan's laws to a section of the RPN
+  //! \param start Starting point for token modification
+  //! \param stop Stopping point for token modification
+  static void apply_demorgan(std::vector<int32_t>::iterator start,
+                             std::vector<int32_t>::iterator stop);
+
+  //! Removes complement operators from the RPN
+  //! \param rpn The rpn to remove complement operators from.
+  static void remove_complement_ops(std::vector<int32_t>& rpn);
+
+  //! Returns the beginning position of a parenthesis block (immediately before
+  //! two surface tokens) in the RPN given a starting position at the end of
+  //! that block (immediately after two surface tokens)
+  //! \param start Starting position of the search
+  //! \param rpn The rpn being searched
+  static std::vector<int32_t>::iterator
+  find_left_parenthesis(std::vector<int32_t>::iterator start,
+                        const std::vector<int32_t>& rpn);
+
 };
 
 //==============================================================================
@@ -183,7 +240,6 @@ protected:
 class DAGCell : public Cell
 {
 public:
-  moab::DagMC* dagmc_ptr_;
   DAGCell();
 
   bool contains(Position r, Direction u, int32_t on_surface) const;
@@ -191,9 +247,44 @@ public:
   std::pair<double, int32_t>
   distance(Position r, Direction u, int32_t on_surface) const;
 
+  BoundingBox bounding_box() const;
+
   void to_hdf5(hid_t group_id) const;
+
+  moab::DagMC* dagmc_ptr_; //!< Pointer to DagMC instance
+  int32_t dag_index_;      //!< DagMC index of cell
 };
 #endif
+
+//==============================================================================
+//! Speeds up geometry searches by grouping cells in a search tree.
+//
+//! Currently this object only works with universes that are divided up by a
+//! bunch of z-planes.  It could be generalized to other planes, cylinders,
+//! and spheres.
+//==============================================================================
+
+class UniversePartitioner
+{
+public:
+  explicit UniversePartitioner(const Universe& univ);
+
+  //! Return the list of cells that could contain the given coordinates.
+  const std::vector<int32_t>& get_cells(Position r, Direction u) const;
+
+private:
+  //! A sorted vector of indices to surfaces that partition the universe
+  std::vector<int32_t> surfs_;
+
+  //! Vectors listing the indices of the cells that lie within each partition
+  //
+  //! There are n+1 partitions with n surfaces.  `partitions_.front()` gives the
+  //! cells that lie on the negative side of `surfs_.front()`.
+  //! `partitions_.back()` gives the cells that lie on the positive side of
+  //! `surfs_.back()`.  Otherwise, `partitions_[i]` gives cells sandwiched
+  //! between `surfs_[i-1]` and `surfs_[i]`.
+  std::vector<std::vector<int32_t>> partitions_;
+};
 
 //==============================================================================
 // Non-member functions

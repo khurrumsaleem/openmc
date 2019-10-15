@@ -11,7 +11,9 @@
 #include <unordered_map>
 #include <utility> // for pair
 
+#ifdef _OPENMP
 #include <omp.h>
+#endif
 #include "xtensor/xview.hpp"
 
 #include "openmc/capi.h"
@@ -73,7 +75,7 @@ void title()
     "         Copyright | 2011-2019 MIT and OpenMC contributors\n" <<
     "           License | http://openmc.readthedocs.io/en/latest/license.html\n" <<
     "           Version | " << VERSION_MAJOR << '.' << VERSION_MINOR << '.'
-    << VERSION_RELEASE << '\n';
+    << VERSION_RELEASE << (VERSION_DEV ? "-dev" : "") << '\n';
 #ifdef GIT_SHA1
   std::cout << "          Git SHA1 | " << GIT_SHA1 << '\n';
 #endif
@@ -142,64 +144,64 @@ std::string time_stamp()
 extern "C" void print_particle(Particle* p)
 {
   // Display particle type and ID.
-  switch (p->type) {
-    case static_cast<int>(ParticleType::neutron):
+  switch (p->type_) {
+    case Particle::Type::neutron:
       std::cout << "Neutron ";
       break;
-    case static_cast<int>(ParticleType::photon):
+    case Particle::Type::photon:
       std::cout << "Photon ";
       break;
-    case static_cast<int>(ParticleType::electron):
+    case Particle::Type::electron:
       std::cout << "Electron ";
       break;
-    case static_cast<int>(ParticleType::positron):
+    case Particle::Type::positron:
       std::cout << "Positron ";
       break;
     default:
       std::cout << "Unknown Particle ";
   }
-  std::cout << p->id << "\n";
+  std::cout << p->id_ << "\n";
 
   // Display particle geometry hierarchy.
-  for (auto i = 0; i < p->n_coord; i++) {
+  for (auto i = 0; i < p->n_coord_; i++) {
     std::cout << "  Level " << i << "\n";
 
-    if (p->coord[i].cell != C_NONE) {
-      const Cell& c {*model::cells[p->coord[i].cell]};
+    if (p->coord_[i].cell != C_NONE) {
+      const Cell& c {*model::cells[p->coord_[i].cell]};
       std::cout << "    Cell             = " << c.id_ << "\n";
     }
 
-    if (p->coord[i].universe != C_NONE) {
-      const Universe& u {*model::universes[p->coord[i].universe]};
+    if (p->coord_[i].universe != C_NONE) {
+      const Universe& u {*model::universes[p->coord_[i].universe]};
       std::cout << "    Universe         = " << u.id_ << "\n";
     }
 
-    if (p->coord[i].lattice != F90_NONE) {
-      const Lattice& lat {*model::lattices[p->coord[i].lattice]};
+    if (p->coord_[i].lattice != C_NONE) {
+      const Lattice& lat {*model::lattices[p->coord_[i].lattice]};
       std::cout << "    Lattice          = " << lat.id_ << "\n";
-      std::cout << "    Lattice position = (" << p->coord[i].lattice_x
-                << "," << p->coord[i].lattice_y << ","
-                << p->coord[i].lattice_z << ")\n";
+      std::cout << "    Lattice position = (" << p->coord_[i].lattice_x
+                << "," << p->coord_[i].lattice_y << ","
+                << p->coord_[i].lattice_z << ")\n";
     }
 
-    std::cout << "    xyz = " << p->coord[i].xyz[0] << " "
-              << p->coord[i].xyz[1] << " " << p->coord[i].xyz[2] << "\n";
-    std::cout << "    uvw = " << p->coord[i].uvw[0] << " "
-              << p->coord[i].uvw[1] << " " << p->coord[i].uvw[2] << "\n";
+    std::cout << "    r = (" << p->coord_[i].r.x << ", "
+              << p->coord_[i].r.y << ", " << p->coord_[i].r.z << ")\n";
+    std::cout << "    u = (" << p->coord_[i].u.x << ", "
+              << p->coord_[i].u.y << ", " << p->coord_[i].u.z << ")\n";
   }
 
   // Display miscellaneous info.
-  if (p->surface != ERROR_INT) {
-    const Surface& surf {*model::surfaces[std::abs(p->surface)-1]};
-    std::cout << "  Surface = " << std::copysign(surf.id_, p->surface) << "\n";
+  if (p->surface_ != 0) {
+    const Surface& surf {*model::surfaces[std::abs(p->surface_)-1]};
+    std::cout << "  Surface = " << std::copysign(surf.id_, p->surface_) << "\n";
   }
-  std::cout << "  Weight = " << p->wgt << "\n";
+  std::cout << "  Weight = " << p->wgt_ << "\n";
   if (settings::run_CE) {
-    std::cout << "  Energy = " << p->E << "\n";
+    std::cout << "  Energy = " << p->E_ << "\n";
   } else {
-    std::cout << "  Energy Group = " << p->g << "\n";
+    std::cout << "  Energy Group = " << p->g_ << "\n";
   }
-  std::cout << "  Delayed Group = " << p->delayed_group << "\n";
+  std::cout << "  Delayed Group = " << p->delayed_group_ << "\n";
 
   std::cout << "\n";
 }
@@ -209,6 +211,7 @@ extern "C" void print_particle(Particle* p)
 void print_plot()
 {
   header("PLOTTING SUMMARY", 5);
+  if (settings::verbosity < 5) return;
 
   for (auto pl : model::plots) {
     // Plot id
@@ -281,9 +284,9 @@ print_overlap_check()
 {
   #ifdef OPENMC_MPI
     std::vector<int64_t> temp(model::overlap_check_count);
-    int err = MPI_Reduce(temp.data(), model::overlap_check_count.data(),
-                         model::overlap_check_count.size(), MPI_INT64_T,
-                         MPI_SUM, 0, mpi::intracomm);
+    MPI_Reduce(temp.data(), model::overlap_check_count.data(),
+               model::overlap_check_count.size(), MPI_INT64_T,
+               MPI_SUM, 0, mpi::intracomm);
   #endif
 
   if (mpi::master) {
@@ -451,6 +454,7 @@ void print_runtime()
 
   // display header block
   header("Timing Statistics", 6);
+  if (settings::verbosity < 6) return;
 
   // Save state of cout
   auto f {std::cout.flags()};
@@ -480,7 +484,7 @@ void print_runtime()
 
   // Calculate particle rate in active/inactive batches
   int n_active = simulation::current_batch - settings::n_inactive;
-  double speed_inactive;
+  double speed_inactive = 0.0;
   double speed_active;
   if (settings::restart_run) {
     if (simulation::restart_batch < settings::n_inactive) {
@@ -490,7 +494,6 @@ void print_runtime()
       speed_active = (settings::n_particles * n_active
         * settings::gen_per_batch) / time_active.elapsed();
     } else {
-      speed_inactive = 0.0;
       speed_active = (settings::n_particles * (settings::n_batches
         - simulation::restart_batch) * settings::gen_per_batch)
         / time_active.elapsed();
@@ -536,6 +539,7 @@ void print_results()
 
   // display header block for results
   header("Results", 4);
+  if (settings::verbosity < 4) return;
 
   // Calculate t-value for confidence intervals
   int n = simulation::n_realizations;
@@ -634,17 +638,22 @@ write_tallies()
   for (auto i_tally = 0; i_tally < model::tallies.size(); ++i_tally) {
     const auto& tally {*model::tallies[i_tally]};
 
+    // Write header block.
+    std::string tally_header("TALLY " + std::to_string(tally.id_));
+    if (!tally.name_.empty()) tally_header += ": " + tally.name_;
+    tallies_out << header(tally_header) << "\n\n";
+
+    if (!tally.writable_) {
+      tallies_out << " Internal\n\n";
+      continue;
+    }
+
     // Calculate t-value for confidence intervals
     double t_value = 1;
     if (settings::confidence_intervals) {
       auto alpha = 1 - CONFIDENCE_LEVEL;
       t_value = t_percentile(1 - alpha*0.5, tally.n_realizations_ - 1);
     }
-
-    // Write header block.
-    std::string tally_header("TALLY " + std::to_string(tally.id_));
-    if (!tally.name_.empty()) tally_header += ": " + tally.name_;
-    tallies_out << header(tally_header) << "\n\n";
 
     // Write derivative information.
     if (tally.deriv_ != C_NONE) {
@@ -657,8 +666,7 @@ write_tallies()
       case DIFF_NUCLIDE_DENSITY:
         tallies_out << " Nuclide density derivative  Material "
           << std::to_string(deriv.diff_material) << "  Nuclide "
-          // TODO: off-by-one
-          << data::nuclides[deriv.diff_nuclide-1]->name_ << "\n";
+          << data::nuclides[deriv.diff_nuclide]->name_ << "\n";
         break;
       case DIFF_TEMPERATURE:
         tallies_out << " Temperature derivative  Material "
@@ -680,13 +688,12 @@ write_tallies()
       // prevents redundant output.
       int indent = 0;
       for (auto i = 0; i < tally.filters().size(); ++i) {
-        if ((filter_index-1) % tally.strides(i) == 0) {
+        if (filter_index % tally.strides(i) == 0) {
           auto i_filt = tally.filters(i);
           const auto& filt {*model::tally_filters[i_filt]};
           auto& match {simulation::filter_matches[i_filt]};
           tallies_out << std::string(indent+1, ' ')
-            // TODO: off-by-one
-            << filt.text_label(match.i_bin_+1) << "\n";
+            << filt.text_label(match.i_bin_) << "\n";
         }
         indent += 2;
       }
@@ -713,9 +720,8 @@ write_tallies()
           std::string score_name = score > 0 ? reaction_name(score)
             : score_names.at(score);
           double mean, stdev;
-          //TODO: off-by-one
           std::tie(mean, stdev) = mean_stdev(
-            &tally.results_(filter_index-1, score_index, 0), tally.n_realizations_);
+            &tally.results_(filter_index, score_index, 0), tally.n_realizations_);
           tallies_out << std::string(indent+1, ' ')  << std::left
             << std::setw(36) << score_name << " " << mean << " +/- "
             << t_value * stdev << "\n";

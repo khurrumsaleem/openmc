@@ -14,22 +14,36 @@ PolarFilter::from_xml(pugi::xml_node node)
 {
   auto bins = get_node_array<double>(node, "bins");
 
-  if (bins.size() > 1) {
-    bins_ = bins;
-
-  } else {
+  if (bins.size() == 1) {
     // Allow a user to input a lone number which will mean that you subdivide
     // [0,pi] evenly with the input being the number of bins
 
     int n_angle = bins[0];
-
-    if (n_angle <= 1) fatal_error("Number of bins for polar filter must "
-                                  "be greater than 1.");
+    if (n_angle <= 1) throw std::runtime_error{
+      "Number of bins for polar filter must be greater than 1."};
 
     double d_angle = PI / n_angle;
-    bins_.resize(n_angle + 1);
-    for (int i = 0; i < n_angle; i++) bins_[i] = i * d_angle;
-    bins_[n_angle] = PI;
+    bins.resize(n_angle + 1);
+    for (int i = 0; i < n_angle; i++) bins[i] = i * d_angle;
+    bins[n_angle] = PI;
+  }
+
+  this->set_bins(bins);
+}
+
+void
+PolarFilter::set_bins(gsl::span<double> bins)
+{
+  // Clear existing bins
+  bins_.clear();
+  bins_.reserve(bins.size());
+
+  // Copy bins, ensuring they are valid
+  for (gsl::index i = 0; i < bins.size(); ++i) {
+    if (i > 0 && bins[i] <= bins[i-1]) {
+      throw std::runtime_error{"Polar bins must be monotonically increasing."};
+    }
+    bins_.push_back(bins[i]);
   }
 
   n_bins_ = bins_.size() - 1;
@@ -41,14 +55,13 @@ const
 {
   double theta;
   if (estimator == ESTIMATOR_TRACKLENGTH) {
-    theta = std::acos(p->coord[0].uvw[2]);
+    theta = std::acos(p->u().z);
   } else {
-    theta = std::acos(p->last_uvw[2]);
+    theta = std::acos(p->u_last_.z);
   }
 
   if (theta >= bins_.front() && theta <= bins_.back()) {
-    //TODO: off-by-one
-    auto bin = lower_bound_index(bins_.begin(), bins_.end(), theta) + 1;
+    auto bin = lower_bound_index(bins_.begin(), bins_.end(), theta);
     match.bins_.push_back(bin);
     match.weights_.push_back(1.0);
   }
@@ -65,8 +78,7 @@ std::string
 PolarFilter::text_label(int bin) const
 {
   std::stringstream out;
-  //TODO: off-by-one
-  out << "Polar Angle [" << bins_[bin-1] << ", " << bins_[bin] << ")";
+  out << "Polar Angle [" << bins_[bin] << ", " << bins_[bin+1] << ")";
   return out.str();
 }
 

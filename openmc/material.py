@@ -1,6 +1,7 @@
 from collections import OrderedDict
 from copy import deepcopy
 from numbers import Real, Integral
+from pathlib import Path
 import warnings
 from xml.etree import ElementTree as ET
 
@@ -276,20 +277,22 @@ class Material(IDManagerMixin):
         """
         mat_id = int(group.name.split('/')[-1].lstrip('material '))
 
-        name = group['name'].value.decode() if 'name' in group else ''
-        density = group['atom_density'].value
+        name = group['name'][()].decode() if 'name' in group else ''
+        density = group['atom_density'][()]
         if 'nuclide_densities' in group:
-            nuc_densities = group['nuclide_densities'][...]
+            nuc_densities = group['nuclide_densities'][()]
 
         # Create the Material
         material = cls(mat_id, name)
         material.depletable = bool(group.attrs['depletable'])
         if 'volume' in group.attrs:
             material.volume = group.attrs['volume']
+        if "temperature" in group.attrs:
+            material.temperature = group.attrs["temperature"]
 
         # Read the names of the S(a,b) tables for this Material and add them
         if 'sab_names' in group:
-            sab_tables = group['sab_names'].value
+            sab_tables = group['sab_names'][()]
             for sab_table in sab_tables:
                 name = sab_table.decode()
                 material.add_s_alpha_beta(name)
@@ -298,13 +301,13 @@ class Material(IDManagerMixin):
         material.set_density(density=density, units='atom/b-cm')
 
         if 'nuclides' in group:
-            nuclides = group['nuclides'].value
+            nuclides = group['nuclides'][()]
             # Add all nuclides to the Material
             for fullname, density in zip(nuclides, nuc_densities):
                 name = fullname.decode().strip()
                 material.add_nuclide(name, percent=density, percent_type='ao')
         if 'macroscopics' in group:
-            macroscopics = group['macroscopics'].value
+            macroscopics = group['macroscopics'][()]
             # Add all macroscopics to the Material
             for fullname in macroscopics:
                 name = fullname.decode().strip()
@@ -840,8 +843,7 @@ class Material(IDManagerMixin):
 
         # Create temperature XML subelement
         if self.temperature is not None:
-            subelement = ET.SubElement(element, "temperature")
-            subelement.text = str(self.temperature)
+            element.set("temperature", str(self.temperature))
 
         # Create density XML subelement
         if self._density is not None or self._density_units == 'sum':
@@ -930,7 +932,12 @@ class Material(IDManagerMixin):
         mat_id = int(elem.get('id'))
         mat = cls(mat_id)
         mat.name = elem.get('name')
-        mat.temperature = elem.get('temperature')
+
+        if "temperature" in elem.attrib:
+            mat.temperature = float(elem.get("temperature"))
+
+        if 'volume' in elem.attrib:
+            mat.volume = float(elem.get('volume'))
         mat.depletable = bool(elem.get('depletable'))
 
         # Get each nuclide
@@ -1062,9 +1069,14 @@ class Materials(cv.CheckedList):
         # Clean the indentation in the file to be user-readable
         clean_indentation(root_element)
 
+        # Check if path is a directory
+        p = Path(path)
+        if p.is_dir():
+            p /= 'materials.xml'
+
         # Write the XML Tree to the materials.xml file
         tree = ET.ElementTree(root_element)
-        tree.write(path, xml_declaration=True, encoding='utf-8')
+        tree.write(str(p), xml_declaration=True, encoding='utf-8')
 
     @classmethod
     def from_xml(cls, path='materials.xml'):

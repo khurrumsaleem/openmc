@@ -18,7 +18,7 @@
 #include "xtensor/xbuilder.hpp"
 #include "xtensor/xview.hpp"
 
-#include <algorithm> // for sort
+#include <algorithm> // for sort, min_element
 #include <string> // for to_string, stoi
 
 namespace openmc {
@@ -30,14 +30,11 @@ namespace openmc {
 namespace data {
 std::array<double, 2> energy_min {0.0, 0.0};
 std::array<double, 2> energy_max {INFTY, INFTY};
+double temperature_min {0.0};
+double temperature_max {INFTY};
 std::vector<std::unique_ptr<Nuclide>> nuclides;
 std::unordered_map<std::string, int> nuclide_map;
 } // namespace data
-
-namespace simulation {
-NuclideMicroXS* micro_xs;
-MaterialMacroXS material_xs;
-} // namespace simulation
 
 //==============================================================================
 // Nuclide implementation
@@ -102,7 +99,7 @@ Nuclide::Nuclide(hid_t group, const std::vector<double>& temperature, int i_nucl
 
       // Determine closest temperature
       double min_delta_T = INFTY;
-      double T_actual;
+      double T_actual = 0.0;
       for (auto T : temps_available) {
         double delta_T = std::abs(T - T_desired);
         if (delta_T < min_delta_T) {
@@ -158,6 +155,12 @@ Nuclide::Nuclide(hid_t group, const std::vector<double>& temperature, int i_nucl
 
   // Sort temperatures to read
   std::sort(temps_to_read.begin(), temps_to_read.end());
+
+  double T_min_read = *std::min_element(temps_to_read.cbegin(), temps_to_read.cend());
+  double T_max_read = *std::max_element(temps_to_read.cbegin(), temps_to_read.cend());
+
+  data::temperature_min = std::max(data::temperature_min, T_min_read);
+  data::temperature_max = std::min(data::temperature_max, T_max_read);
 
   hid_t energy_group = open_group(group, "energy");
   for (const auto& T : temps_to_read) {
@@ -282,13 +285,12 @@ void Nuclide::create_derived()
     reaction_index_[rx->mt_] = i;
 
     for (int t = 0; t < kTs_.size(); ++t) {
-      // TODO: off-by-one
-      int j = rx->xs_[t].threshold - 1;
+      int j = rx->xs_[t].threshold;
       int n = rx->xs_[t].value.size();
       auto xs = xt::adapt(rx->xs_[t].value);
 
       for (const auto& p : rx->products_) {
-        if (p.particle_ == ParticleType::photon) {
+        if (p.particle_ == Particle::Type::photon) {
           auto pprod = xt::view(xs_[t], xt::range(j, j+n), XS_PHOTON_PROD);
           for (int k = 0; k < n; ++k) {
             double E = grid_[t].energy[k+j];
@@ -392,7 +394,7 @@ void Nuclide::create_derived()
 
 void Nuclide::init_grid()
 {
-  int neutron = static_cast<int>(ParticleType::neutron);
+  int neutron = static_cast<int>(Particle::Type::neutron);
   double E_min = data::energy_min[neutron];
   double E_max = data::energy_max[neutron];
   int M = settings::n_log_bins;
@@ -414,7 +416,7 @@ void Nuclide::init_grid()
       while (std::log(grid.energy[j + 1]/E_min) <= umesh(k)) {
         // Ensure that for isotopes where maxval(grid.energy) << E_max that
         // there are no out-of-bounds issues.
-        if (j + 1 == grid.energy.size()) break;
+        if (j + 2 == grid.energy.size()) break;
         ++j;
       }
       grid.grid_index[k] = j;
@@ -441,7 +443,7 @@ double Nuclide::nu(double E, EmissionMode mode, int group) const
         for (int i = 1; i < rx->products_.size(); ++i) {
           // Skip any non-neutron products
           const auto& product = rx->products_[i];
-          if (product.particle_ != ParticleType::neutron) continue;
+          if (product.particle_ != Particle::Type::neutron) continue;
 
           // Evaluate yield
           if (product.emission_mode_ == EmissionMode::delayed) {
@@ -460,14 +462,15 @@ double Nuclide::nu(double E, EmissionMode mode, int group) const
       return (*fission_rx_[0]->products_[0].yield_)(E);
     }
   }
+  UNREACHABLE();
 }
 
-void Nuclide::calculate_elastic_xs() const
+void Nuclide::calculate_elastic_xs(Particle& p) const
 {
   // Get temperature index, grid index, and interpolation factor
-  auto& micro = simulation::micro_xs[i_nuclide_];
+  auto& micro {p.neutron_xs_[i_nuclide_]};
   int i_temp = micro.index_temp;
-  int i_grid = micro.index_grid - 1;
+  int i_grid = micro.index_grid;
   double f = micro.interp_factor;
 
   if (i_temp >= 0) {
@@ -499,42 +502,41 @@ double Nuclide::elastic_xs_0K(double E) const
   return (1.0 - f)*elastic_0K_[i_grid] + f*elastic_0K_[i_grid + 1];
 }
 
-void Nuclide::calculate_xs(int i_sab, double E, int i_log_union,
-  double sqrtkT, double sab_frac)
+void Nuclide::calculate_xs(int i_sab, int i_log_union, double sab_frac, Particle& p)
 {
-  auto& micro_xs = simulation::micro_xs[i_nuclide_];
+  auto& micro {p.neutron_xs_[i_nuclide_]};
 
   // Initialize cached cross sections to zero
-  micro_xs.elastic = CACHE_INVALID;
-  micro_xs.thermal = 0.0;
-  micro_xs.thermal_elastic = 0.0;
+  micro.elastic = CACHE_INVALID;
+  micro.thermal = 0.0;
+  micro.thermal_elastic = 0.0;
 
   // Check to see if there is multipole data present at this energy
   bool use_mp = false;
   if (multipole_) {
-    use_mp = (E >= multipole_->E_min_ && E <= multipole_->E_max_);
+    use_mp = (p.E_ >= multipole_->E_min_ && p.E_ <= multipole_->E_max_);
   }
 
   // Evaluate multipole or interpolate
   if (use_mp) {
     // Call multipole kernel
     double sig_s, sig_a, sig_f;
-    std::tie(sig_s, sig_a, sig_f) = multipole_->evaluate(E, sqrtkT);
+    std::tie(sig_s, sig_a, sig_f) = multipole_->evaluate(p.E_, p.sqrtkT_);
 
-    micro_xs.total = sig_s + sig_a;
-    micro_xs.elastic = sig_s;
-    micro_xs.absorption = sig_a;
-    micro_xs.fission = sig_f;
-    micro_xs.nu_fission = fissionable_ ?
-      sig_f * this->nu(E, EmissionMode::total) : 0.0;
+    micro.total = sig_s + sig_a;
+    micro.elastic = sig_s;
+    micro.absorption = sig_a;
+    micro.fission = sig_f;
+    micro.nu_fission = fissionable_ ?
+      sig_f * this->nu(p.E_, EmissionMode::total) : 0.0;
 
     if (simulation::need_depletion_rx) {
       // Only non-zero reaction is (n,gamma)
-      micro_xs.reaction[0] = sig_a - sig_f;
+      micro.reaction[0] = sig_a - sig_f;
 
       // Set all other reaction cross sections to zero
       for (int i = 1; i < DEPLETION_RX.size(); ++i) {
-        micro_xs.reaction[i] = 0.0;
+        micro.reaction[i] = 0.0;
       }
     }
 
@@ -548,13 +550,13 @@ void Nuclide::calculate_xs(int i_sab, double E, int i_log_union,
     // resonance range, so the value here does not matter.  index_temp is
     // set to -1 to force a segfault in case a developer messes up and tries
     // to use it with multipole.
-    micro_xs.index_temp = -1;
-    micro_xs.index_grid = 0;
-    micro_xs.interp_factor = 0.0;
+    micro.index_temp = -1;
+    micro.index_grid = -1;
+    micro.interp_factor = 0.0;
 
   } else {
     // Find the appropriate temperature index.
-    double kT = sqrtkT*sqrtkT;
+    double kT = p.sqrtkT_*p.sqrtkT_;
     double f;
     int i_temp = -1;
     switch (settings::temperature_method) {
@@ -591,9 +593,9 @@ void Nuclide::calculate_xs(int i_sab, double E, int i_log_union,
     const auto& xs {xs_[i_temp]};
 
     int i_grid;
-    if (E < grid.energy.front()) {
+    if (p.E_ < grid.energy.front()) {
       i_grid = 0;
-    } else if (E > grid.energy.back()) {
+    } else if (p.E_ > grid.energy.back()) {
       i_grid = grid.energy.size() - 2;
     } else {
       // Determine bounding indices based on which equal log-spaced
@@ -602,50 +604,49 @@ void Nuclide::calculate_xs(int i_sab, double E, int i_log_union,
       int i_high = grid.grid_index[i_log_union + 1] + 1;
 
       // Perform binary search over reduced range
-      i_grid = i_low + lower_bound_index(&grid.energy[i_low], &grid.energy[i_high], E);
+      i_grid = i_low + lower_bound_index(&grid.energy[i_low], &grid.energy[i_high], p.E_);
     }
 
     // check for rare case where two energy points are the same
     if (grid.energy[i_grid] == grid.energy[i_grid + 1]) ++i_grid;
 
     // calculate interpolation factor
-    f = (E - grid.energy[i_grid]) /
+    f = (p.E_ - grid.energy[i_grid]) /
       (grid.energy[i_grid + 1]- grid.energy[i_grid]);
 
-    micro_xs.index_temp = i_temp;
-    // TODO: off-by-one
-    micro_xs.index_grid = i_grid + 1;
-    micro_xs.interp_factor = f;
+    micro.index_temp = i_temp;
+    micro.index_grid = i_grid;
+    micro.interp_factor = f;
 
     // Calculate microscopic nuclide total cross section
-    micro_xs.total = (1.0 - f)*xs(i_grid, XS_TOTAL)
+    micro.total = (1.0 - f)*xs(i_grid, XS_TOTAL)
           + f*xs(i_grid + 1, XS_TOTAL);
 
     // Calculate microscopic nuclide absorption cross section
-    micro_xs.absorption = (1.0 - f)*xs(i_grid, XS_ABSORPTION)
+    micro.absorption = (1.0 - f)*xs(i_grid, XS_ABSORPTION)
       + f*xs(i_grid + 1, XS_ABSORPTION);
 
     if (fissionable_) {
       // Calculate microscopic nuclide total cross section
-      micro_xs.fission = (1.0 - f)*xs(i_grid, XS_FISSION)
+      micro.fission = (1.0 - f)*xs(i_grid, XS_FISSION)
             + f*xs(i_grid + 1, XS_FISSION);
 
       // Calculate microscopic nuclide nu-fission cross section
-      micro_xs.nu_fission = (1.0 - f)*xs(i_grid, XS_NU_FISSION)
+      micro.nu_fission = (1.0 - f)*xs(i_grid, XS_NU_FISSION)
         + f*xs(i_grid + 1, XS_NU_FISSION);
     } else {
-      micro_xs.fission = 0.0;
-      micro_xs.nu_fission = 0.0;
+      micro.fission = 0.0;
+      micro.nu_fission = 0.0;
     }
 
     // Calculate microscopic nuclide photon production cross section
-    micro_xs.photon_prod = (1.0 - f)*xs(i_grid, XS_PHOTON_PROD)
+    micro.photon_prod = (1.0 - f)*xs(i_grid, XS_PHOTON_PROD)
       + f*xs(i_grid + 1, XS_PHOTON_PROD);
 
     // Depletion-related reactions
     if (simulation::need_depletion_rx) {
       // Initialize all reaction cross sections to zero
-      for (double& xs_i : micro_xs.reaction) {
+      for (double& xs_i : micro.reaction) {
         xs_i = 0.0;
       }
 
@@ -660,15 +661,14 @@ void Nuclide::calculate_xs(int i_sab, double E, int i_log_union,
           // Physics says that (n,gamma) is not a threshold reaction, so we don't
           // need to specifically check its threshold index
           if (j == 0) {
-            micro_xs.reaction[0] = (1.0 - f)*rx_xs[i_grid]
+            micro.reaction[0] = (1.0 - f)*rx_xs[i_grid]
               + f*rx_xs[i_grid + 1];
             continue;
           }
 
-          // TODO: off-by-one
-          int threshold = rx->xs_[i_temp].threshold - 1;
+          int threshold = rx->xs_[i_temp].threshold;
           if (i_grid >= threshold) {
-            micro_xs.reaction[j] = (1.0 - f)*rx_xs[i_grid - threshold] +
+            micro.reaction[j] = (1.0 - f)*rx_xs[i_grid - threshold] +
               f*rx_xs[i_grid - threshold + 1];
           } else if (j >= 3) {
             // One can show that the the threshold for (n,(x+1)n) is always
@@ -683,35 +683,35 @@ void Nuclide::calculate_xs(int i_sab, double E, int i_log_union,
   }
 
   // Initialize sab treatment to false
-  micro_xs.index_sab = C_NONE;
-  micro_xs.sab_frac = 0.0;
+  micro.index_sab = C_NONE;
+  micro.sab_frac = 0.0;
 
   // Initialize URR probability table treatment to false
-  micro_xs.use_ptable = false;
+  micro.use_ptable = false;
 
   // If there is S(a,b) data for this nuclide, we need to set the sab_scatter
   // and sab_elastic cross sections and correct the total and elastic cross
   // sections.
 
-  if (i_sab >= 0) this->calculate_sab_xs(i_sab, E, sqrtkT, sab_frac);
+  if (i_sab >= 0) this->calculate_sab_xs(i_sab, sab_frac, p);
 
   // If the particle is in the unresolved resonance range and there are
   // probability tables, we need to determine cross sections from the table
   if (settings::urr_ptables_on && urr_present_ && !use_mp) {
-    int n = urr_data_[micro_xs.index_temp].n_energy_;
-    if ((E > urr_data_[micro_xs.index_temp].energy_(0)) &&
-        (E < urr_data_[micro_xs.index_temp].energy_(n-1))) {
-      this->calculate_urr_xs(micro_xs.index_temp, E);
+    int n = urr_data_[micro.index_temp].n_energy_;
+    if ((p.E_ > urr_data_[micro.index_temp].energy_(0)) &&
+        (p.E_ < urr_data_[micro.index_temp].energy_(n-1))) {
+      this->calculate_urr_xs(micro.index_temp, p);
     }
   }
 
-  micro_xs.last_E = E;
-  micro_xs.last_sqrtkT = sqrtkT;
+  micro.last_E = p.E_;
+  micro.last_sqrtkT = p.sqrtkT_;
 }
 
-void Nuclide::calculate_sab_xs(int i_sab, double E, double sqrtkT, double sab_frac)
+void Nuclide::calculate_sab_xs(int i_sab, double sab_frac, Particle& p)
 {
-  auto& micro {simulation::micro_xs[i_nuclide_]};
+  auto& micro {p.neutron_xs_[i_nuclide_]};
 
   // Set flag that S(a,b) treatment should be used for scattering
   micro.index_sab = i_sab;
@@ -720,14 +720,14 @@ void Nuclide::calculate_sab_xs(int i_sab, double E, double sqrtkT, double sab_fr
   int i_temp;
   double elastic;
   double inelastic;
-  data::thermal_scatt[i_sab]->calculate_xs(E, sqrtkT, &i_temp, &elastic, &inelastic);
+  data::thermal_scatt[i_sab]->calculate_xs(p.E_, p.sqrtkT_, &i_temp, &elastic, &inelastic);
 
   // Store the S(a,b) cross sections.
   micro.thermal = sab_frac * (elastic + inelastic);
   micro.thermal_elastic = sab_frac * elastic;
 
   // Calculate free atom elastic cross section
-  this->calculate_elastic_xs();
+  this->calculate_elastic_xs(p);
 
   // Correct total and elastic cross sections
   micro.total = micro.total + micro.thermal - sab_frac*micro.elastic;
@@ -738,9 +738,9 @@ void Nuclide::calculate_sab_xs(int i_sab, double E, double sqrtkT, double sab_fr
   micro.sab_frac = sab_frac;
 }
 
-void Nuclide::calculate_urr_xs(int i_temp, double E) const
+void Nuclide::calculate_urr_xs(int i_temp, Particle& p) const
 {
-  auto& micro = simulation::micro_xs[i_nuclide_];
+  auto& micro = p.neutron_xs_[i_nuclide_];
   micro.use_ptable = true;
 
   // Create a shorthand for the URR data
@@ -748,7 +748,7 @@ void Nuclide::calculate_urr_xs(int i_temp, double E) const
 
   // Determine the energy table
   int i_energy = 0;
-  while (E >= urr.energy_(i_energy + 1)) {++i_energy;};
+  while (p.E_ >= urr.energy_(i_energy + 1)) {++i_energy;};
 
   // Sample the probability table using the cumulative distribution
 
@@ -776,7 +776,7 @@ void Nuclide::calculate_urr_xs(int i_temp, double E) const
   double f;
   if (urr.interp_ == Interpolation::lin_lin) {
     // Determine the interpolation factor on the table
-    f = (E - urr.energy_(i_energy)) /
+    f = (p.E_ - urr.energy_(i_energy)) /
          (urr.energy_(i_energy + 1) - urr.energy_(i_energy));
 
     elastic = (1. - f) * urr.prob_(i_energy, URR_ELASTIC, i_low) +
@@ -787,7 +787,7 @@ void Nuclide::calculate_urr_xs(int i_temp, double E) const
          f * urr.prob_(i_energy + 1, URR_N_GAMMA, i_up);
   } else if (urr.interp_ == Interpolation::log_log) {
     // Determine interpolation factor on the table
-    f = std::log(E / urr.energy_(i_energy)) /
+    f = std::log(p.E_ / urr.energy_(i_energy)) /
          std::log(urr.energy_(i_energy + 1) / urr.energy_(i_energy));
 
     // Calculate the elastic cross section/factor
@@ -841,7 +841,7 @@ void Nuclide::calculate_urr_xs(int i_temp, double E) const
 
   // Multiply by smooth cross-section if needed
   if (urr.multiply_smooth_) {
-    calculate_elastic_xs();
+    calculate_elastic_xs(p);
     elastic *= micro.elastic;
     capture *= (micro.absorption - micro.fission);
     fission *= micro.fission;
@@ -861,7 +861,7 @@ void Nuclide::calculate_urr_xs(int i_temp, double E) const
 
   // Determine nu-fission cross-section
   if (fissionable_) {
-    micro.nu_fission = nu(E, EmissionMode::total) * micro.fission;
+    micro.nu_fission = nu(p.E_, EmissionMode::total) * micro.fission;
   }
 
 }

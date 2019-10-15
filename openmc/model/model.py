@@ -1,4 +1,5 @@
 from collections.abc import Iterable
+from pathlib import Path
 
 import openmc
 from openmc.checkvalue import check_type, check_value
@@ -123,7 +124,7 @@ class Model(object):
                 self._plots.append(plot)
 
     def deplete(self, timesteps, chain_file=None, method='cecm',
-                **kwargs):
+                fission_q=None, **kwargs):
         """Deplete model using specified timesteps/power
 
         Parameters
@@ -132,49 +133,68 @@ class Model(object):
             Array of timesteps in units of [s]. Note that values are not
             cumulative.
         chain_file : str, optional
-            Path to the depletion chain XML file.  Defaults to the
-            :envvar:`OPENMC_DEPLETE_CHAIN` environment variable if it exists.
+            Path to the depletion chain XML file.  Defaults to the chain
+            found under the ``depletion_chain`` in the
+            :envvar:`OPENMC_CROSS_SECTIONS` environment variable if it exists.
         method : str
              Integration method used for depletion (e.g., 'cecm', 'predictor')
+        fission_q : dict, optional
+            Dictionary of nuclides and their fission Q values [eV].
+            If not given, values will be pulled from the ``chain_file``.
         **kwargs
             Keyword arguments passed to integration function (e.g.,
             :func:`openmc.deplete.integrator.cecm`)
 
         """
         # Import the depletion module.  This is done here rather than the module
-        # header to delay importing openmc.capi (through openmc.deplete) which
+        # header to delay importing openmc.lib (through openmc.deplete) which
         # can be tough to install properly.
         import openmc.deplete as dep
 
         # Create OpenMC transport operator
-        op = dep.Operator(self.geometry, self.settings, chain_file)
+        op = dep.Operator(
+            self.geometry, self.settings, chain_file,
+            fission_q=fission_q,
+        )
 
         # Perform depletion
         check_value('method', method, ('cecm', 'predictor', 'cf4', 'epc_rk4',
                                        'si_celi', 'si_leqi', 'celi', 'leqi'))
         getattr(dep.integrator, method)(op, timesteps, **kwargs)
 
-    def export_to_xml(self):
-        """Export model to XML files."""
+    def export_to_xml(self, directory='.'):
+        """Export model to XML files.
 
-        self.settings.export_to_xml()
+        Parameters
+        ----------
+        directory : str
+            Directory to write XML files to. If it doesn't exist already, it
+            will be created.
+
+        """
+        # Create directory if
+        d = Path(directory)
+        if not d.is_dir():
+            d.mkdir(parents=True)
+
+        self.settings.export_to_xml(d)
         if not self.settings.dagmc:
-            self.geometry.export_to_xml()
+            self.geometry.export_to_xml(d)
 
         # If a materials collection was specified, export it. Otherwise, look
         # for all materials in the geometry and use that to automatically build
         # a collection.
         if self.materials:
-            self.materials.export_to_xml()
+            self.materials.export_to_xml(d)
         else:
             materials = openmc.Materials(self.geometry.get_all_materials()
                                          .values())
-            materials.export_to_xml()
+            materials.export_to_xml(d)
 
         if self.tallies:
-            self.tallies.export_to_xml()
+            self.tallies.export_to_xml(d)
         if self.plots:
-            self.plots.export_to_xml()
+            self.plots.export_to_xml(d)
 
     def run(self, **kwargs):
         """Creates the XML files, runs OpenMC, and returns k-effective

@@ -96,7 +96,7 @@ Mgxs::metadata_from_hdf5(hid_t xs_id, const std::vector<double>& temperature,
   // Determine the available temperatures
   hid_t kT_group = open_group(xs_id, "kTs");
   int num_temps = get_num_datasets(kT_group);
-  char* dset_names[num_temps];
+  char** dset_names = new char*[num_temps];
   for (int i = 0; i < num_temps; i++) {
     dset_names[i] = new char[151];
   }
@@ -111,6 +111,7 @@ Mgxs::metadata_from_hdf5(hid_t xs_id, const std::vector<double>& temperature,
     // Done with dset_names, so delete it
     delete[] dset_names[i];
   }
+  delete[] dset_names;
   std::sort(available_temps.begin(), available_temps.end());
 
   // If only one temperature is available, lets just use nearest temperature
@@ -329,8 +330,6 @@ Mgxs::Mgxs(const std::string& in_name, const std::vector<double>& mat_kTs,
   // Force all of the following data to be the same; these will be verified
   // to be true later
   int in_scatter_format = micros[0]->scatter_format;
-  int in_num_groups = micros[0]->num_groups;
-  int in_num_delayed_groups = micros[0]->num_delayed_groups;
   bool in_is_isotropic = micros[0]->is_isotropic;
   std::vector<double> in_polar = micros[0]->polar;
   std::vector<double> in_azimuthal = micros[0]->azimuthal;
@@ -523,7 +522,7 @@ Mgxs::get_xs(int xstype, int gin, const int* gout, const double* mu,
     break;
   case MG_GET_XS_DECAY_RATE:
     if (dg != nullptr) {
-      val = xs_t->decay_rate(a, *dg + 1);
+      val = xs_t->decay_rate(a, *dg);
     } else {
       val = xs_t->decay_rate(a, 0);
     }
@@ -616,7 +615,7 @@ Mgxs::sample_scatter(int gin, int& gout, double& mu, double& wgt)
 //==============================================================================
 
 void
-Mgxs::calculate_xs(int gin, double sqrtkT, const double uvw[3],
+Mgxs::calculate_xs(int gin, double sqrtkT, Direction u,
      double& total_xs, double& abs_xs, double& nu_fiss_xs)
 {
   // Set our indices
@@ -626,7 +625,7 @@ Mgxs::calculate_xs(int gin, double sqrtkT, const double uvw[3],
   int tid = 0;
 #endif
   set_temperature_index(sqrtkT);
-  set_angle_index(uvw);
+  set_angle_index(u);
   XsData* xs_t = &xs[cache[tid].t];
   total_xs = xs_t->total(cache[tid].a, gin);
   abs_xs = xs_t->absorption(cache[tid].a, gin);
@@ -668,7 +667,7 @@ Mgxs::set_temperature_index(double sqrtkT)
 //==============================================================================
 
 void
-Mgxs::set_angle_index(const double uvw[3])
+Mgxs::set_angle_index(Direction u)
 {
   // See if we need to find the new index
 #ifdef _OPENMP
@@ -677,11 +676,11 @@ Mgxs::set_angle_index(const double uvw[3])
   int tid = 0;
 #endif
   if (!is_isotropic &&
-      ((uvw[0] != cache[tid].u) || (uvw[1] != cache[tid].v) ||
-       (uvw[2] != cache[tid].w))) {
-    // convert uvw to polar and azimuthal angles
-    double my_pol = std::acos(uvw[2]);
-    double my_azi = std::atan2(uvw[1], uvw[0]);
+      ((u.x != cache[tid].u) || (u.y != cache[tid].v) ||
+       (u.z != cache[tid].w))) {
+    // convert direction to polar and azimuthal angles
+    double my_pol = std::acos(u.z);
+    double my_azi = std::atan2(u.y, u.x);
 
     // Find the location, assuming equal-bin angles
     double delta_angle = PI / n_pol;
@@ -692,9 +691,9 @@ Mgxs::set_angle_index(const double uvw[3])
     cache[tid].a = n_azi * p + a;
 
     // store this direction as the last one used
-    cache[tid].u = uvw[0];
-    cache[tid].v = uvw[1];
-    cache[tid].w = uvw[2];
+    cache[tid].u = u.x;
+    cache[tid].v = u.y;
+    cache[tid].w = u.z;
   }
 }
 

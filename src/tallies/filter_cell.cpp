@@ -12,40 +12,49 @@ namespace openmc {
 void
 CellFilter::from_xml(pugi::xml_node node)
 {
-  cells_ = get_node_array<int32_t>(node, "bins");
-  n_bins_ = cells_.size();
+  // Get cell IDs and convert into indices into the global cells vector
+  auto cells = get_node_array<int32_t>(node, "bins");
+  for (auto& c : cells) {
+    auto search = model::cell_map.find(c);
+    if (search == model::cell_map.end()) {
+      std::stringstream err_msg;
+      err_msg << "Could not find cell " << c
+              << " specified on tally filter.";
+      throw std::runtime_error{err_msg.str()};
+    }
+    c = search->second;
+  }
+
+  this->set_cells(cells);
 }
 
 void
-CellFilter::initialize()
+CellFilter::set_cells(gsl::span<int32_t> cells)
 {
-  // Convert cell IDs to indices of the global array.
-  for (auto& c : cells_) {
-    auto search = model::cell_map.find(c);
-    if (search != model::cell_map.end()) {
-      c = search->second;
-    } else {
-      std::stringstream err_msg;
-      err_msg << "Could not find cell " << c << " specified on tally filter.";
-      fatal_error(err_msg);
-    }
+  // Clear existing cells
+  cells_.clear();
+  cells_.reserve(cells.size());
+  map_.clear();
+
+  // Update cells and mapping
+  for (auto& index : cells) {
+    Expects(index >= 0);
+    Expects(index < model::cells.size());
+    cells_.push_back(index);
+    map_[index] = cells_.size() - 1;
   }
 
-  // Populate the index->bin map.
-  for (int i = 0; i < cells_.size(); i++) {
-    map_[cells_[i]] = i;
-  }
+  n_bins_ = cells_.size();
 }
 
 void
 CellFilter::get_all_bins(const Particle* p, int estimator,
                          FilterMatch& match) const
 {
-  for (int i = 0; i < p->n_coord; i++) {
-    auto search = map_.find(p->coord[i].cell);
+  for (int i = 0; i < p->n_coord_; i++) {
+    auto search = map_.find(p->coord_[i].cell);
     if (search != map_.end()) {
-      //TODO: off-by-one
-      match.bins_.push_back(search->second + 1);
+      match.bins_.push_back(search->second);
       match.weights_.push_back(1.0);
     }
   }
@@ -63,8 +72,7 @@ CellFilter::to_statepoint(hid_t filter_group) const
 std::string
 CellFilter::text_label(int bin) const
 {
-  //TODO: off-by-one
-  return "Cell " + std::to_string(model::cells[cells_[bin-1]]->id_);
+  return "Cell " + std::to_string(model::cells[cells_[bin]]->id_);
 }
 
 //==============================================================================
@@ -72,20 +80,19 @@ CellFilter::text_label(int bin) const
 //==============================================================================
 
 extern "C" int
-openmc_cell_filter_get_bins(int32_t index, int32_t** cells, int32_t* n)
+openmc_cell_filter_get_bins(int32_t index, const int32_t** cells, int32_t* n)
 {
   if (int err = verify_filter(index)) return err;
 
-  // TODO: off-by-one
-  const auto& filt = model::tally_filters[index-1].get();
+  const auto& filt = model::tally_filters[index].get();
   if (filt->type() != "cell") {
     set_errmsg("Tried to get cells from a non-cell filter.");
     return OPENMC_E_INVALID_TYPE;
   }
 
   auto cell_filt = static_cast<CellFilter*>(filt);
-  *cells = cell_filt->cells_.data();
-  *n = cell_filt->cells_.size();
+  *cells = cell_filt->cells().data();
+  *n = cell_filt->cells().size();
   return 0;
 }
 

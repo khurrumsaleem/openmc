@@ -211,14 +211,13 @@ class VolumeCalculation(object):
                     domain_id = int(obj_name[7:])
                     ids.append(domain_id)
                     group = f[obj_name]
-                    volume = ufloat(*group['volume'].value)
-                    nucnames = group['nuclides'].value
-                    atoms_ = group['atoms'].value
-
+                    volume = ufloat(*group['volume'][()])
+                    volumes[domain_id] = volume
+                    nucnames = group['nuclides'][()]
+                    atoms_ = group['atoms'][()]
                     atom_dict = OrderedDict()
                     for name_i, atoms_i in zip(nucnames, atoms_):
                         atom_dict[name_i.decode()] = ufloat(*atoms_i)
-                    volumes[domain_id] = volume
                     atoms[domain_id] = atom_dict
 
         # Instantiate some throw-away domains that are used by the constructor

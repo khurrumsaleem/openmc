@@ -66,7 +66,7 @@ void
 adjust_indices()
 {
   // Adjust material/fill idices.
-  for (Cell* c : model::cells) {
+  for (auto& c : model::cells) {
     if (c->fill_ != C_NONE) {
       int32_t id = c->fill_;
       auto search_univ = model::universe_map.find(id);
@@ -85,25 +85,24 @@ adjust_indices()
       }
     } else {
       c->type_ = FILL_MATERIAL;
-      for (auto it = c->material_.begin(); it != c->material_.end(); it++) {
-        int32_t mid = *it;
-        if (mid != MATERIAL_VOID) {
-          auto search = model::material_map.find(mid);
-          if (search != model::material_map.end()) {
-            *it = search->second;
-          } else {
+      for (auto& mat_id : c->material_) {
+        if (mat_id != MATERIAL_VOID) {
+          auto search = model::material_map.find(mat_id);
+          if (search == model::material_map.end()) {
             std::stringstream err_msg;
-            err_msg << "Could not find material " << mid
+            err_msg << "Could not find material " << mat_id
                     << " specified on cell " << c->id_;
             fatal_error(err_msg);
           }
+          // Change from ID to index
+          mat_id = search->second;
         }
       }
     }
   }
 
   // Change cell.universe values from IDs to indices.
-  for (Cell* c : model::cells) {
+  for (auto& c : model::cells) {
     auto search = model::universe_map.find(c->universe_);
     if (search != model::universe_map.end()) {
       c->universe_ = search->second;
@@ -116,8 +115,42 @@ adjust_indices()
   }
 
   // Change all lattice universe values from IDs to indices.
-  for (Lattice* l : model::lattices) {
+  for (auto& l : model::lattices) {
     l->adjust_indices();
+  }
+}
+
+//==============================================================================
+//! Partition some universes with many z-planes for faster find_cell searches.
+
+void
+partition_universes()
+{
+  // Iterate over universes with more than 10 cells.  (Fewer than 10 is likely
+  // not worth partitioning.)
+  for (const auto& univ : model::universes) {
+    if (univ->cells_.size() > 10) {
+      // Collect the set of surfaces in this universe.
+      std::unordered_set<int32_t> surf_inds;
+      for (auto i_cell : univ->cells_) {
+        for (auto token : model::cells[i_cell]->rpn_) {
+          if (token < OP_UNION) surf_inds.insert(std::abs(token) - 1);
+        }
+      }
+
+      // Partition the universe if there are more than 5 z-planes.  (Fewer than
+      // 5 is likely not worth it.)
+      int n_zplanes = 0;
+      for (auto i_surf : surf_inds) {
+        if (dynamic_cast<const SurfaceZPlane*>(model::surfaces[i_surf].get())) {
+          ++n_zplanes;
+          if (n_zplanes > 5) {
+            univ->partitioner_ = std::make_unique<UniversePartitioner>(*univ);
+            break;
+          }
+        }
+      }
+    }
   }
 }
 
@@ -126,7 +159,7 @@ adjust_indices()
 void
 assign_temperatures()
 {
-  for (Cell* c : model::cells) {
+  for (auto& c : model::cells) {
     // Ignore non-material cells and cells with defined temperature.
     if (c->material_.size() == 0) continue;
     if (c->sqrtkT_.size() > 0) continue;
@@ -167,16 +200,25 @@ get_temperatures(std::vector<std::vector<double>>& nuc_temps,
       int i_material = cell->material_[j];
       if (i_material == MATERIAL_VOID) continue;
 
-      // Get temperature of cell (rounding to nearest integer)
-      double sqrtkT = cell->sqrtkT_.size() == 1 ?
-        cell->sqrtkT_[j] : cell->sqrtkT_[0];
-      double temperature = sqrtkT*sqrtkT / K_BOLTZMANN;
+      // Get temperature(s) of cell (rounding to nearest integer)
+      std::vector<double> cell_temps;
+      if (cell->sqrtkT_.size() == 1) {
+        double sqrtkT = cell->sqrtkT_[0];
+        cell_temps.push_back(sqrtkT*sqrtkT / K_BOLTZMANN);
+      } else if (cell->sqrtkT_.size() == cell->material_.size()) {
+        double sqrtkT = cell->sqrtkT_[j];
+        cell_temps.push_back(sqrtkT*sqrtkT / K_BOLTZMANN);
+      } else {
+        for (double sqrtkT : cell->sqrtkT_)
+          cell_temps.push_back(sqrtkT*sqrtkT / K_BOLTZMANN);
+      }
 
       const auto& mat {model::materials[i_material]};
       for (const auto& i_nuc : mat->nuclide_) {
-        // Add temperature if it hasn't already been added
-        if (!contains(nuc_temps[i_nuc], temperature)) {
-          nuc_temps[i_nuc].push_back(temperature);
+        for (double temperature : cell_temps) {
+          // Add temperature if it hasn't already been added
+          if (!contains(nuc_temps[i_nuc], temperature))
+            nuc_temps[i_nuc].push_back(temperature);
         }
       }
 
@@ -184,9 +226,10 @@ get_temperatures(std::vector<std::vector<double>>& nuc_temps,
         // Get index in data::thermal_scatt array
         int i_sab = table.index_table;
 
-        // Add temperature if it hasn't already been added
-        if (!contains(thermal_temps[i_sab], temperature)) {
-          thermal_temps[i_sab].push_back(temperature);
+        for (double temperature : cell_temps) {
+          // Add temperature if it hasn't already been added
+          if (!contains(thermal_temps[i_sab], temperature))
+            thermal_temps[i_sab].push_back(temperature);
         }
       }
     }
@@ -201,6 +244,7 @@ void finalize_geometry(std::vector<std::vector<double>>& nuc_temps,
   // Perform some final operations to set up the geometry
   adjust_indices();
   count_cell_instances(model::root_universe);
+  partition_universes();
 
   // Assign temperatures to cells that don't have temperatures already assigned
   assign_temperatures();
@@ -208,14 +252,8 @@ void finalize_geometry(std::vector<std::vector<double>>& nuc_temps,
   // Determine desired temperatures for each nuclide and S(a,b) table
   get_temperatures(nuc_temps, thermal_temps);
 
-  // Check to make sure there are not too many nested coordinate levels in the
-  // geometry since the coordinate list is statically allocated for performance
-  // reasons
-  if (maximum_levels(model::root_universe) > MAX_COORD) {
-    fatal_error("Too many nested coordinate levels in the geometry. "
-      "Try increasing the maximum number of coordinate levels by "
-      "providing the CMake -Dmaxcoord= option.");
-  }
+  // Determine number of nested coordinate levels in the geometry
+  model::n_coord_levels = maximum_levels(model::root_universe);
 }
 
 //==============================================================================
@@ -225,12 +263,12 @@ find_root_universe()
 {
   // Find all the universes listed as a cell fill.
   std::unordered_set<int32_t> fill_univ_ids;
-  for (Cell* c : model::cells) {
+  for (const auto& c : model::cells) {
     fill_univ_ids.insert(c->fill_);
   }
 
   // Find all the universes contained in a lattice.
-  for (Lattice* lat : model::lattices) {
+  for (const auto& lat : model::lattices) {
     for (auto it = lat->begin(); it != lat->end(); ++it) {
       fill_univ_ids.insert(*it);
     }
@@ -271,7 +309,7 @@ prepare_distribcell()
   for (auto& filt : model::tally_filters) {
     auto* distrib_filt = dynamic_cast<DistribcellFilter*>(filt.get());
     if (distrib_filt) {
-      distribcells.insert(distrib_filt->cell_);
+      distribcells.insert(distrib_filt->cell());
     }
   }
 
@@ -309,7 +347,7 @@ prepare_distribcell()
   // unique distribcell array index.
   int distribcell_index = 0;
   std::vector<int32_t> target_univ_ids;
-  for (Universe* u : model::universes) {
+  for (const auto& u : model::universes) {
     for (auto cell_indx : u->cells_) {
       if (distribcells.find(cell_indx) != distribcells.end()) {
         model::cells[cell_indx]->distribcell_index_ = distribcell_index;
@@ -321,19 +359,19 @@ prepare_distribcell()
 
   // Allocate the cell and lattice offset tables.
   int n_maps = target_univ_ids.size();
-  for (Cell* c : model::cells) {
+  for (auto& c : model::cells) {
     if (c->type_ != FILL_MATERIAL) {
       c->offset_.resize(n_maps, C_NONE);
     }
   }
-  for (Lattice* lat : model::lattices) {
+  for (auto& lat : model::lattices) {
     lat->allocate_offset_table(n_maps);
   }
 
   // Fill the cell and lattice offset tables.
   for (int map = 0; map < target_univ_ids.size(); map++) {
     auto target_univ_id = target_univ_ids[map];
-    for (Universe* univ : model::universes) {
+    for (const auto& univ : model::universes) {
       int32_t offset {0};  // TODO: is this a bug?  It matches F90 implementation.
       for (int32_t cell_indx : univ->cells_) {
         Cell& c = *model::cells[cell_indx];
@@ -516,15 +554,12 @@ maximum_levels(int32_t univ)
 void
 free_memory_geometry()
 {
-  for (Cell* c : model::cells) {delete c;}
   model::cells.clear();
   model::cell_map.clear();
 
-  for (Universe* u : model::universes) {delete u;}
   model::universes.clear();
   model::universe_map.clear();
 
-  for (Lattice* lat : model::lattices) {delete lat;}
   model::lattices.clear();
   model::lattice_map.clear();
 

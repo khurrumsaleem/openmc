@@ -1,9 +1,11 @@
 #include "openmc/plot.h"
 
+#include <algorithm>
 #include <fstream>
 #include <sstream>
 
-#include "openmc/cell.h"
+#include "xtensor/xview.hpp"
+
 #include "openmc/constants.h"
 #include "openmc/file_utils.h"
 #include "openmc/geometry.h"
@@ -17,6 +19,7 @@
 #include "openmc/progress_bar.h"
 #include "openmc/random_lcg.h"
 #include "openmc/settings.h"
+#include "openmc/simulation.h"
 #include "openmc/string_utils.h"
 
 namespace openmc {
@@ -25,8 +28,49 @@ namespace openmc {
 // Constants
 //==============================================================================
 
-const RGBColor WHITE {255, 255, 255};
+
 constexpr int PLOT_LEVEL_LOWEST {-1}; //!< lower bound on plot universe level
+constexpr int32_t NOT_FOUND {-2};
+constexpr int32_t OVERLAP {-3};
+
+IdData::IdData(size_t h_res, size_t v_res)
+  : data_({v_res, h_res, 2}, NOT_FOUND)
+{ }
+
+void
+IdData::set_value(size_t y, size_t x, const Particle& p, int level) {
+  Cell* c = model::cells[p.coord_[level].cell].get();
+  data_(y,x,0) = c->id_;
+  if (p.material_ == MATERIAL_VOID) {
+    data_(y,x,1) = MATERIAL_VOID;
+    return;
+  } else if (c->type_ != FILL_UNIVERSE) {
+    Material* m = model::materials[p.material_].get();
+    data_(y,x,1) = m->id_;
+  }
+}
+
+void IdData::set_overlap(size_t y, size_t x) {
+  xt::view(data_, y, x, xt::all()) = OVERLAP;
+}
+
+PropertyData::PropertyData(size_t h_res, size_t v_res)
+  : data_({v_res, h_res, 2}, NOT_FOUND)
+{ }
+
+void
+PropertyData::set_value(size_t y, size_t x, const Particle& p, int level) {
+  Cell* c = model::cells[p.coord_[level].cell].get();
+  data_(y,x,0) = (p.sqrtkT_ * p.sqrtkT_) / K_BOLTZMANN;
+  if (c->type_ != FILL_UNIVERSE && p.material_ != MATERIAL_VOID) {
+    Material* m = model::materials[p.material_].get();
+    data_(y,x,1) = m->density_gpcc_;
+  }
+}
+
+void PropertyData::set_overlap(size_t y, size_t x) {
+  data_(y, x) = OVERLAP;
+}
 
 //==============================================================================
 // Global variables
@@ -46,8 +90,6 @@ std::unordered_map<int, int> plot_map;
 extern "C"
 int openmc_plot_geometry()
 {
-  int err;
-
   for (auto pl : model::plots) {
     std::stringstream ss;
     ss << "Processing plot " << pl.id_ << ": "
@@ -99,61 +141,33 @@ void create_ppm(Plot pl)
   size_t width = pl.pixels_[0];
   size_t height = pl.pixels_[1];
 
-  double in_pixel = (pl.width_[0])/static_cast<double>(width);
-  double out_pixel = (pl.width_[1])/static_cast<double>(height);
+  ImageData data({width, height}, pl.not_found_);
 
-  ImageData data;
-  data.resize({width, height});
+  // generate ids for the plot
+  auto ids = pl.get_map<IdData>();
 
-  int in_i, out_i;
-  double xyz[3];
-  switch(pl.basis_) {
-  case PlotBasis::xy :
-    in_i = 0;
-    out_i = 1;
-    xyz[0] = pl.origin_[0] - pl.width_[0] / 2.;
-    xyz[1] = pl.origin_[1] + pl.width_[1] / 2.;
-    xyz[2] = pl.origin_[2];
-    break;
-  case PlotBasis::xz :
-    in_i = 0;
-    out_i = 2;
-    xyz[0] = pl.origin_[0] - pl.width_[0] / 2.;
-    xyz[1] = pl.origin_[1];
-    xyz[2] = pl.origin_[2] + pl.width_[1] / 2.;
-    break;
-  case PlotBasis::yz :
-    in_i = 1;
-    out_i = 2;
-    xyz[0] = pl.origin_[0];
-    xyz[1] = pl.origin_[1] - pl.width_[0] / 2.;
-    xyz[2] = pl.origin_[2] + pl.width_[1] / 2.;
-    break;
-  }
+  // assign colors
+  for (size_t y = 0; y < height; y++) {
+    for (size_t x = 0; x < width; x++) {
+      auto id = ids.data_(y, x, pl.color_by_);
+      // no setting needed if not found
+      if (id == NOT_FOUND) { continue; }
+      if (id == OVERLAP) {
+        data(x,y) = pl.overlap_color_;
+        continue;
+      }
+      if (PlotColorBy::cells == pl.color_by_) {
+        data(x,y) = pl.colors_[model::cell_map[id]];
+      } else if (PlotColorBy::mats == pl.color_by_) {
+        if (id == MATERIAL_VOID) {
+          data(x,y) = WHITE;
+          continue;
+        }
+        data(x,y) = pl.colors_[model::material_map[id]];
+      } // color_by if-else
+    } // x for loop
+  } // y for loop
 
-  double dir[3] = {0.5, 0.5, 0.5};
-
-#pragma omp parallel
-{
-  Particle p;
-  p.initialize();
-  std::copy(xyz, xyz+3, p.coord[0].xyz);
-  std::copy(dir, dir+3, p.coord[0].uvw);
-  p.coord[0].universe = model::root_universe;
-
-#pragma omp for
-  for (int y = 0; y < height; y++) {
-    p.coord[0].xyz[out_i] = xyz[out_i] - out_pixel * y;
-    for (int x = 0; x < width; x++) {
-      // local variables
-      RGBColor rgb;
-      int id;
-      p.coord[0].xyz[in_i] = xyz[in_i] + in_pixel * x;
-      position_rgb(p, pl, rgb, id);
-      data(x,y) = rgb;
-    }
-  }
-}
   // draw mesh lines if present
   if (pl.index_meshlines_mesh_ >= 0) {draw_mesh_lines(pl, data);}
 
@@ -275,9 +289,6 @@ Plot::set_bg_color(pugi::xml_node plot_node)
               << id_;
       fatal_error(err_msg);
     }
-  } else {
-    // default to a white background
-    not_found_ = WHITE;
   }
 }
 
@@ -309,11 +320,9 @@ void
 Plot::set_origin(pugi::xml_node plot_node)
 {
   // Copy plotting origin
-  std::vector<double> pl_origin = get_node_array<double>(plot_node, "origin");
+  auto pl_origin = get_node_array<double>(plot_node, "origin");
   if (pl_origin.size() == 3) {
-    origin_[0] = pl_origin[0];
-    origin_[1] = pl_origin[1];
-    origin_[2] = pl_origin[2];
+    origin_ = pl_origin;
   } else {
     std::stringstream err_msg;
     err_msg << "Origin must be length 3 in plot "
@@ -329,8 +338,8 @@ Plot::set_width(pugi::xml_node plot_node)
   std::vector<double> pl_width = get_node_array<double>(plot_node, "width");
   if (PlotType::slice == type_) {
     if (pl_width.size() == 2) {
-      width_[0] = pl_width[0];
-      width_[1] = pl_width[1];
+      width_.x = pl_width[0];
+      width_.y = pl_width[1];
     } else {
       std::stringstream err_msg;
       err_msg << "<width> must be length 2 in slice plot "
@@ -340,9 +349,7 @@ Plot::set_width(pugi::xml_node plot_node)
   } else if (PlotType::voxel == type_) {
     if (pl_width.size() == 3) {
       pl_width = get_node_array<double>(plot_node, "width");
-      width_[0] = pl_width[0];
-      width_[1] = pl_width[1];
-      width_[2] = pl_width[2];
+      width_ = pl_width;
     } else {
       std::stringstream err_msg;
       err_msg << "<width> must be length 3 in voxel plot "
@@ -391,6 +398,10 @@ Plot::set_default_colors(pugi::xml_node plot_node)
 
   for (auto& c : colors_) {
     c = random_color();
+    // make sure we don't interfere with some default colors
+    while (c == RED || c == WHITE) {
+      c = random_color();
+    }
   }
 }
 
@@ -501,20 +512,38 @@ Plot::set_meshlines(pugi::xml_node plot_node)
 
       // Set mesh based on type
       if ("ufs" == meshtype) {
-        if (settings::index_ufs_mesh < 0) {
+        if (!simulation::ufs_mesh) {
           std::stringstream err_msg;
           err_msg << "No UFS mesh for meshlines on plot " << id_;
           fatal_error(err_msg);
         } else {
-          index_meshlines_mesh_ = settings::index_ufs_mesh;
+          for (int i = 0; i < model::meshes.size(); ++i) {
+            if (const auto* m
+                = dynamic_cast<const RegularMesh*>(model::meshes[i].get())) {
+              if (m == simulation::ufs_mesh) {
+                index_meshlines_mesh_ = i;
+              }
+            }
+          }
+          if (index_meshlines_mesh_ == -1)
+            fatal_error("Could not find the UFS mesh for meshlines plot");
         }
       } else if ("entropy" == meshtype) {
-        if (settings::index_entropy_mesh < 0) {
+        if (!simulation::entropy_mesh) {
           std::stringstream err_msg;
-          err_msg <<"No entropy mesh for meshlines on plot " << id_;
+          err_msg << "No entropy mesh for meshlines on plot " << id_;
           fatal_error(err_msg);
         } else {
-          index_meshlines_mesh_ = settings::index_entropy_mesh;
+          for (int i = 0; i < model::meshes.size(); ++i) {
+            if (const auto* m
+                = dynamic_cast<const RegularMesh*>(model::meshes[i].get())) {
+              if (m == simulation::entropy_mesh) {
+                index_meshlines_mesh_ = i;
+              }
+            }
+          }
+          if (index_meshlines_mesh_ == -1)
+            fatal_error("Could not find the entropy mesh for meshlines plot");
         }
       } else if ("tally" == meshtype) {
         // Ensure that there is a mesh id if the type is tally
@@ -623,8 +652,39 @@ Plot::set_mask(pugi::xml_node plot_node)
   }
 }
 
-Plot::Plot(pugi::xml_node plot_node):
-index_meshlines_mesh_(-1)
+void Plot::set_overlap_color(pugi::xml_node plot_node) {
+  color_overlaps_ = false;
+  if (check_for_node(plot_node, "show_overlaps")) {
+    color_overlaps_ = get_node_value_bool(plot_node, "show_overlaps");
+    // check for custom overlap color
+    if (check_for_node(plot_node, "overlap_color")) {
+      if (!color_overlaps_) {
+        std::stringstream wrn_msg;
+        wrn_msg << "Overlap color specified in plot " << id_
+                << " but overlaps won't be shown.";
+        warning(wrn_msg);
+      }
+      std::vector<int> olap_clr = get_node_array<int>(plot_node, "overlap_color");
+      if (olap_clr.size() == 3) {
+        overlap_color_ = olap_clr;
+      } else {
+        std::stringstream err_msg;
+        err_msg << "Bad overlap RGB in plot " << id_;
+        fatal_error(err_msg);
+      }
+    }
+  }
+
+  // make sure we allocate the vector for counting overlap checks if
+  // they're going to be plotted
+  if (color_overlaps_ && settings::run_mode == RUN_MODE_PLOTTING) {
+    settings::check_overlaps = true;
+    model::overlap_check_count.resize(model::cells.size(), 0);
+  }
+}
+
+Plot::Plot(pugi::xml_node plot_node)
+  : index_meshlines_mesh_{-1}, overlap_color_{RED}
 {
   set_id(plot_node);
   set_type(plot_node);
@@ -638,54 +698,8 @@ index_meshlines_mesh_(-1)
   set_user_colors(plot_node);
   set_meshlines(plot_node);
   set_mask(plot_node);
+  set_overlap_color(plot_node);
 } // End Plot constructor
-
-//==============================================================================
-// POSITION_RGB computes the red/green/blue values for a given plot with the
-// current particle's position
-//==============================================================================
-
-
-void position_rgb(Particle p, Plot pl, RGBColor& rgb, int& id)
-{
-  p.n_coord = 1;
-
-  bool found_cell = find_cell(&p, 0);
-
-  int j = p.n_coord - 1;
-
-  if (settings::check_overlaps) {check_cell_overlap(&p);}
-
-  // Set coordinate level if specified
-  if (pl.level_ >= 0) {j = pl.level_ + 1;}
-
-  if (!found_cell) {
-    // If no cell, revert to default color
-    rgb = pl.not_found_;
-    id = -1;
-  } else {
-    if (PlotColorBy::mats == pl.color_by_) {
-      // Assign color based on material
-      Cell* c = model::cells[p.coord[j].cell];
-      if (c->type_ == FILL_UNIVERSE) {
-        // If we stopped on a middle universe level, treat as if not found
-        rgb = pl.not_found_;
-        id = -1;
-      } else if (p.material == MATERIAL_VOID) {
-        // By default, color void cells white
-        rgb = WHITE;
-        id = -1;
-      } else {
-        rgb = pl.colors_[p.material - 1];
-        id = model::materials[p.material - 1]->id_;
-      }
-    } else if (PlotColorBy::cells == pl.color_by_) {
-      // Assign color based on cell
-      rgb = pl.colors_[p.coord[j].cell];
-      id = model::cells[p.coord[j].cell]->id_;
-    }
-  } // endif found_cell
-}
 
 //==============================================================================
 // OUTPUT_PPM writes out a previously generated image to a PPM file
@@ -730,115 +744,110 @@ void draw_mesh_lines(Plot pl, ImageData& data)
   RGBColor rgb;
   rgb = pl.meshlines_color_;
 
-  int outer, inner;
+  int ax1, ax2;
   switch(pl.basis_) {
   case PlotBasis::xy :
-    outer = 0;
-    inner = 1;
+    ax1 = 0;
+    ax2 = 1;
     break;
   case PlotBasis::xz :
-    outer = 0;
-    inner = 2;
+    ax1 = 0;
+    ax2 = 2;
     break;
   case PlotBasis::yz :
-    outer = 1;
-    inner = 2;
+    ax1 = 1;
+    ax2 = 2;
     break;
+  default:
+    UNREACHABLE();
   }
 
-  double xyz_ll_plot[3], xyz_ur_plot[3];
-  xyz_ll_plot[0] = pl.origin_[0];
-  xyz_ll_plot[1] = pl.origin_[1];
-  xyz_ll_plot[2] = pl.origin_[2];
+  Position ll_plot {pl.origin_};
+  Position ur_plot {pl.origin_};
 
-  xyz_ur_plot[0] = pl.origin_[0];
-  xyz_ur_plot[1] = pl.origin_[1];
-  xyz_ur_plot[2] = pl.origin_[2];
+  ll_plot[ax1] -= pl.width_[0] / 2.;
+  ll_plot[ax2] -= pl.width_[1] / 2.;
+  ur_plot[ax1] += pl.width_[0] / 2.;
+  ur_plot[ax2] += pl.width_[1] / 2.;
 
-  xyz_ll_plot[outer] = pl.origin_[outer] - pl.width_[0] / 2.;
-  xyz_ll_plot[inner] = pl.origin_[inner] - pl.width_[1] / 2.;
-  xyz_ur_plot[outer] = pl.origin_[outer] + pl.width_[0] / 2.;
-  xyz_ur_plot[inner] = pl.origin_[inner] + pl.width_[1] / 2.;
+  Position width = ur_plot - ll_plot;
 
-  int width[3];
-  width[0] = xyz_ur_plot[0] - xyz_ll_plot[0];
-  width[1] = xyz_ur_plot[1] - xyz_ll_plot[1];
-  width[2] = xyz_ur_plot[2] - xyz_ll_plot[2];
+  // Find the (axis-aligned) lines of the mesh that intersect this plot.
+  auto axis_lines = model::meshes[pl.index_meshlines_mesh_]
+    ->plot(ll_plot, ur_plot);
 
-  auto& m = model::meshes[pl.index_meshlines_mesh_];
+  // Find the bounds along the second axis (accounting for low-D meshes).
+  int ax2_min, ax2_max;
+  if (axis_lines.second.size() > 0) {
+    double frac = (axis_lines.second.back() - ll_plot[ax2]) / width[ax2];
+    ax2_min = (1.0 - frac) * pl.pixels_[1];
+    if (ax2_min < 0) ax2_min = 0;
+    frac = (axis_lines.second.front() - ll_plot[ax2]) / width[ax2];
+    ax2_max = (1.0 - frac) * pl.pixels_[1];
+    if (ax2_max > pl.pixels_[1]) ax2_max = pl.pixels_[1];
+  } else {
+    ax2_min = 0;
+    ax2_max = pl.pixels_[1];
+  }
 
-  int ijk_ll[3], ijk_ur[3];
-  bool in_mesh;
-  m->get_indices(Position(xyz_ll_plot), &(ijk_ll[0]), &in_mesh);
-  m->get_indices(Position(xyz_ur_plot), &(ijk_ur[0]), &in_mesh);
-
-  // Fortran/C++ index correction
-  ijk_ur[0]++; ijk_ur[1]++; ijk_ur[2]++;
-
-  double xyz_ll[3], xyz_ur[3];
-  // sweep through all meshbins on this plane and draw borders
-  for (int i = ijk_ll[outer]; i <= ijk_ur[outer]; i++) {
-    for (int j = ijk_ll[inner]; j <= ijk_ur[inner]; j++) {
-      // check if we're in the mesh for this ijk
-      if (i > 0 && i <= m->shape_[outer] && j >0 && j <= m->shape_[inner] ) {
-        int outrange[3], inrange[3];
-        // get xyz's of lower left and upper right of this mesh cell
-        xyz_ll[outer] = m->lower_left_[outer] + m->width_[outer] * (i - 1);
-        xyz_ll[inner] = m->lower_left_[inner] + m->width_[inner] * (j - 1);
-        xyz_ur[outer] = m->lower_left_[outer] + m->width_[outer] * i;
-        xyz_ur[inner] = m->lower_left_[inner] + m->width_[inner] * j;
-
-        // map the xyz ranges to pixel ranges
-        double frac = (xyz_ll[outer] - xyz_ll_plot[outer]) / width[outer];
-        outrange[0] = int(frac * double(pl.pixels_[0]));
-        frac = (xyz_ur[outer] - xyz_ll_plot[outer]) / width[outer];
-        outrange[1] = int(frac * double(pl.pixels_[0]));
-
-        frac = (xyz_ur[inner] - xyz_ll_plot[inner]) / width[inner];
-        inrange[0] = int((1. - frac) * (double)pl.pixels_[1]);
-        frac = (xyz_ll[inner] - xyz_ll_plot[inner]) / width[inner];
-        inrange[1] = int((1. - frac) * (double)pl.pixels_[1]);
-
-        // draw lines
-        for (int out_ = outrange[0]; out_ <= outrange[1]; out_++) {
-          for (int plus = 0; plus <= pl.meshlines_width_; plus++) {
-            data(out_, inrange[0] + plus) = rgb;
-            data(out_, inrange[1] + plus) = rgb;
-            data(out_, inrange[0] - plus) = rgb;
-            data(out_, inrange[1] - plus) = rgb;
-          }
-        }
-
-        for (int in_ = inrange[0]; in_ <= inrange[1]; in_++) {
-          for (int plus = 0; plus <= pl.meshlines_width_; plus++) {
-            data(outrange[0] + plus, in_) = rgb;
-            data(outrange[1] + plus, in_) = rgb;
-            data(outrange[0] - plus, in_) = rgb;
-            data(outrange[1] - plus, in_) = rgb;
-          }
-        }
-
-      } // end if(in mesh)
+  // Iterate across the first axis and draw lines.
+  for (auto ax1_val : axis_lines.first) {
+    double frac = (ax1_val - ll_plot[ax1]) / width[ax1];
+    int ax1_ind = frac * pl.pixels_[0];
+    for (int ax2_ind = ax2_min; ax2_ind < ax2_max; ++ax2_ind) {
+      for (int plus = 0; plus <= pl.meshlines_width_; plus++) {
+        if (ax1_ind+plus >= 0 && ax1_ind+plus < pl.pixels_[0])
+          data(ax1_ind+plus, ax2_ind) = rgb;
+        if (ax1_ind-plus >= 0 && ax1_ind-plus < pl.pixels_[0])
+          data(ax1_ind-plus, ax2_ind) = rgb;
+      }
     }
-  } // end outer loops
-} // end draw_mesh_lines
+  }
+
+  // Find the bounds along the first axis.
+  int ax1_min, ax1_max;
+  if (axis_lines.first.size() > 0) {
+    double frac = (axis_lines.first.front() - ll_plot[ax1]) / width[ax1];
+    ax1_min = frac * pl.pixels_[0];
+    if (ax1_min < 0) ax1_min = 0;
+    frac = (axis_lines.first.back() - ll_plot[ax1]) / width[ax1];
+    ax1_max = frac * pl.pixels_[0];
+    if (ax1_max > pl.pixels_[0]) ax1_max = pl.pixels_[0];
+  } else {
+    ax1_min = 0;
+    ax1_max = pl.pixels_[0];
+  }
+
+  // Iterate across the second axis and draw lines.
+  for (auto ax2_val : axis_lines.second) {
+    double frac = (ax2_val - ll_plot[ax2]) / width[ax2];
+    int ax2_ind = (1.0 - frac) * pl.pixels_[1];
+    for (int ax1_ind = ax1_min; ax1_ind < ax1_max; ++ax1_ind) {
+      for (int plus = 0; plus <= pl.meshlines_width_; plus++) {
+        if (ax2_ind+plus >= 0 && ax2_ind+plus < pl.pixels_[1])
+          data(ax1_ind, ax2_ind+plus) = rgb;
+        if (ax2_ind-plus >= 0 && ax2_ind-plus < pl.pixels_[1])
+          data(ax1_ind, ax2_ind-plus) = rgb;
+      }
+    }
+  }
+}
 
 //==============================================================================
 // CREATE_VOXEL outputs a binary file that can be input into silomesh for 3D
 // geometry visualization.  It works the same way as create_ppm by dragging a
 // particle across the geometry for the specified number of voxels. The first 3
-// int(4)'s in the binary are the number of x, y, and z voxels.  The next 3
-// real(8)'s are the widths of the voxels in the x, y, and z directions. The
-// next 3 real(8)'s are the x, y, and z coordinates of the lower left
-// point. Finally the binary is filled with entries of four int(4)'s each. Each
-// 'row' in the binary contains four int(4)'s: 3 for x,y,z position and 1 for
+// int's in the binary are the number of x, y, and z voxels.  The next 3
+// double's are the widths of the voxels in the x, y, and z directions. The
+// next 3 double's are the x, y, and z coordinates of the lower left
+// point. Finally the binary is filled with entries of four int's each. Each
+// 'row' in the binary contains four int's: 3 for x,y,z position and 1 for
 // cell or material id.  For 1 million voxels this produces a file of
 // approximately 15MB.
 // =============================================================================
 
 void create_voxel(Plot pl)
 {
-
   // compute voxel widths in each direction
   std::array<double, 3> vox;
   vox[0] = pl.width_[0]/(double)pl.pixels_[0];
@@ -846,18 +855,7 @@ void create_voxel(Plot pl)
   vox[2] = pl.width_[2]/(double)pl.pixels_[2];
 
   // initial particle position
-  std::array<double, 3> ll;
-  ll[0] = pl.origin_[0] - pl.width_[0] / 2.;
-  ll[1] = pl.origin_[1] - pl.width_[1] / 2.;
-  ll[2] = pl.origin_[2] - pl.width_[2] / 2.;
-
-  // allocate and initialize particle
-  double dir[3] = {0.5, 0.5, 0.5};
-  Particle p;
-  p.initialize();
-  std::copy(ll.begin(), ll.begin()+ll.size(), p.coord[0].xyz);
-  std::copy(dir, dir+3, p.coord[0].uvw);
-  p.coord[0].universe = model::root_universe;
+  Position ll = pl.origin_ - pl.width_ / 2.;
 
   // Open binary plot file for writing
   std::ofstream of;
@@ -876,57 +874,49 @@ void create_voxel(Plot pl)
 
   // Write current date and time
   write_attribute(file_id, "date_and_time", time_stamp().c_str());
-  hsize_t three = 3;
-  write_attribute(file_id, "num_voxels", pl.pixels_);
+  std::array<int, 3> pixels;
+  std::copy(pl.pixels_.begin(), pl.pixels_.end(), pixels.begin());
+  write_attribute(file_id, "num_voxels", pixels);
   write_attribute(file_id, "voxel_width", vox);
   write_attribute(file_id, "lower_left", ll);
 
   // Create dataset for voxel data -- note that the dimensions are reversed
   // since we want the order in the file to be z, y, x
   hsize_t dims[3];
-  dims[0] = pl.pixels_[0];
+  dims[0] = pl.pixels_[2];
   dims[1] = pl.pixels_[1];
-  dims[2] = pl.pixels_[2];
+  dims[2] = pl.pixels_[0];
   hid_t dspace, dset, memspace;
   voxel_init(file_id, &(dims[0]), &dspace, &dset, &memspace);
 
-  // move to center of voxels
-  ll[0] = ll[0] + vox[0] / 2.;
-  ll[1] = ll[1] + vox[1] / 2.;
-  ll[2] = ll[2] + vox[2] / 2.;
-
-  int data[pl.pixels_[1]][pl.pixels_[2]];
+  PlotBase pltbase;
+  pltbase.width_ = pl.width_;
+  pltbase.origin_ = pl.origin_;
+  pltbase.basis_ = PlotBasis::xy;
+  pltbase.pixels_ = pl.pixels_;
+  pltbase.level_ = -1; // all universes for voxel files
+  pltbase.color_overlaps_ = pl.color_overlaps_;
 
   ProgressBar pb;
+  for (int z = 0; z < pl.pixels_[2]; z++) {
+    // update progress bar
+    pb.set_value(100.*(double)z/(double)(pl.pixels_[2]-1));
 
-  RGBColor rgb;
-  int id;
-  for (int x = 0; x < pl.pixels_[0]; x++) {
-    pb.set_value(100.*(double)x/(double)(pl.pixels_[0]-1));
-    for (int y = 0; y < pl.pixels_[1]; y++) {
-      for (int z = 0; z < pl.pixels_[2]; z++) {
-        // get voxel color
-        position_rgb(p, pl, rgb, id);
-        // write to plot data
-        data[y][z] = id;
-        // advance particle in z direction
-        p.coord[0].xyz[2] = p.coord[0].xyz[2] + vox[2];
-      }
-      // advance particle in y direction
-      p.coord[0].xyz[1] = p.coord[0].xyz[1] + vox[1];
-      p.coord[0].xyz[2] = ll[2];
-    }
-    // advance particle in x direction
-    p.coord[0].xyz[0] = p.coord[0].xyz[0] + vox[0];
-    p.coord[0].xyz[1] = ll[1];
-    p.coord[0].xyz[2] = ll[2];
+    // update z coordinate
+    pltbase.origin_.z = ll.z + z * vox[2];
+
+    // generate ids using plotbase
+    IdData ids = pltbase.get_map<IdData>();
+
+    // select only cell ID data and flip the y-axis
+    xt::xtensor<int32_t, 2> data1 = xt::flip(xt::view(ids.data_, xt::all(), xt::all(), 0), 0);
+
     // Write to HDF5 dataset
-    voxel_write_slice(x, dspace, dset, memspace, &(data[0]));
+    voxel_write_slice(z, dspace, dset, memspace, &(data1(0,0)));
   }
 
   voxel_finalize(dspace, dset, memspace);
   file_close(file_id);
-
 }
 
 void
@@ -969,5 +959,47 @@ voxel_finalize(hid_t dspace, hid_t dset, hid_t memspace)
 RGBColor random_color() {
   return {int(prn()*255), int(prn()*255), int(prn()*255)};
 }
+
+extern "C" int openmc_id_map(const void* plot, int32_t* data_out)
+{
+
+  auto plt = reinterpret_cast<const PlotBase*>(plot);
+  if (!plt) {
+    set_errmsg("Invalid slice pointer passed to openmc_id_map");
+    return OPENMC_E_INVALID_ARGUMENT;
+  }
+
+  if (plt->color_overlaps_ && model::overlap_check_count.size() == 0) {
+    model::overlap_check_count.resize(model::cells.size());
+  }
+
+  auto ids = plt->get_map<IdData>();
+
+  // write id data to array
+  std::copy(ids.data_.begin(), ids.data_.end(), data_out);
+
+  return 0;
+}
+
+extern "C" int openmc_property_map(const void* plot, double* data_out) {
+
+  auto plt = reinterpret_cast<const PlotBase*>(plot);
+  if (!plt) {
+    set_errmsg("Invalid slice pointer passed to openmc_id_map");
+    return OPENMC_E_INVALID_ARGUMENT;
+  }
+
+  if (plt->color_overlaps_ && model::overlap_check_count.size() == 0) {
+    model::overlap_check_count.resize(model::cells.size());
+  }
+
+  auto props = plt->get_map<PropertyData>();
+
+  // write id data to array
+  std::copy(props.data_.begin(), props.data_.end(), data_out);
+
+  return 0;
+}
+
 
 } // namespace openmc

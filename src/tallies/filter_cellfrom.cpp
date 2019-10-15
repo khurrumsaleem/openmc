@@ -8,11 +8,10 @@ void
 CellFromFilter::get_all_bins(const Particle* p, int estimator,
                              FilterMatch& match) const
 {
-  for (int i = 0; i < p->last_n_coord; i++) {
-    auto search = map_.find(p->last_cell[i]);
+  for (int i = 0; i < p->n_coord_last_; i++) {
+    auto search = map_.find(p->cell_last_[i]);
     if (search != map_.end()) {
-      //TODO: off-by-one
-      match.bins_.push_back(search->second + 1);
+      match.bins_.push_back(search->second);
       match.weights_.push_back(1.0);
     }
   }
@@ -21,8 +20,7 @@ CellFromFilter::get_all_bins(const Particle* p, int estimator,
 std::string
 CellFromFilter::text_label(int bin) const
 {
-  //TODO: off-by-one
-  return "Cell from " + std::to_string(model::cells[cells_[bin-1]]->id_);
+  return "Cell from " + std::to_string(model::cells[cells_[bin]]->id_);
 }
 
 } // namespace openmc

@@ -228,7 +228,7 @@ read_ce_cross_sections(const std::vector<std::vector<double>>& nuc_temps,
       // Determine if minimum/maximum energy for this nuclide is greater/less
       // than the previous
       if (data::nuclides[i_nuclide]->grid_.size() >= 1) {
-        int neutron = static_cast<int>(ParticleType::neutron);
+        int neutron = static_cast<int>(Particle::Type::neutron);
         data::energy_min[neutron] = std::max(data::energy_min[neutron],
           data::nuclides[i_nuclide]->grid_[0].energy.front());
         data::energy_max[neutron] = std::min(data::energy_max[neutron],
@@ -239,15 +239,13 @@ read_ce_cross_sections(const std::vector<std::vector<double>>& nuc_temps,
       already_read.insert(name);
 
       // Check if elemental data has been read, if needed
-      int pos = name.find_first_of("0123456789");
-      std::string element = name.substr(0, pos);
+      std::string element = to_element(name);
       if (settings::photon_transport) {
         if (already_read.find(element) == already_read.end()) {
           // Read photon interaction data from HDF5 photon library
           LibraryKey key {Library::Type::photon, element};
           int idx = data::library_map[key];
           std::string& filename = data::libraries[idx].path_;
-          int i_element = data::element_map[element];
           write_message("Reading " + element + " from " + filename, 6);
 
           // Open file and make sure version is sufficient
@@ -262,7 +260,7 @@ read_ce_cross_sections(const std::vector<std::vector<double>>& nuc_temps,
           // the previous
           const auto& elem {data::elements.back()};
           if (elem.energy_.size() >= 1) {
-            int photon = static_cast<int>(ParticleType::photon);
+            int photon = static_cast<int>(Particle::Type::photon);
             int n = elem.energy_.size();
             data::energy_min[photon] = std::max(data::energy_min[photon],
               std::exp(elem.energy_(1)));
@@ -321,7 +319,7 @@ read_ce_cross_sections(const std::vector<std::vector<double>>& nuc_temps,
   for (auto& nuc : data::nuclides) {
     nuc->init_grid();
   }
-  int neutron = static_cast<int>(ParticleType::neutron);
+  int neutron = static_cast<int>(Particle::Type::neutron);
   simulation::log_spacing = std::log(data::energy_max[neutron] /
     data::energy_min[neutron]) / settings::n_log_bins;
 
@@ -329,7 +327,7 @@ read_ce_cross_sections(const std::vector<std::vector<double>>& nuc_temps,
     // Determine if minimum/maximum energy for bremsstrahlung is greater/less
     // than the current minimum/maximum
     if (data::ttb_e_grid.size() >= 1) {
-      int photon = static_cast<int>(ParticleType::photon);
+      int photon = static_cast<int>(Particle::Type::photon);
       int n_e = data::ttb_e_grid.size();
       data::energy_min[photon] = std::max(data::energy_min[photon], data::ttb_e_grid(1));
       data::energy_max[photon] = std::min(data::energy_max[photon], data::ttb_e_grid(n_e - 1));
@@ -345,7 +343,7 @@ read_ce_cross_sections(const std::vector<std::vector<double>>& nuc_temps,
     // grid has not been allocated
     if (nuc->grid_.size() > 0) {
       double max_E = nuc->grid_[0].energy.back();
-      int neutron = static_cast<int>(ParticleType::neutron);
+      int neutron = static_cast<int>(Particle::Type::neutron);
       if (max_E == data::energy_max[neutron]) {
         write_message("Maximum neutron transport energy: " +
           std::to_string(data::energy_max[neutron]) + " eV for " +
@@ -358,6 +356,12 @@ read_ce_cross_sections(const std::vector<std::vector<double>>& nuc_temps,
       }
     }
   }
+
+  // Show minimum/maximum temperature
+  write_message("Minimum neutron data temperature: " +
+    std::to_string(data::temperature_min) + " K", 4);
+  write_message("Maximum neutron data temperature: " +
+    std::to_string(data::temperature_max) + " K", 4);
 
   // If the user wants multipole, make sure we found a multipole library.
   if (settings::temperature_multipole) {
@@ -404,6 +408,10 @@ void read_ce_cross_sections_xml()
     // If no directory is listed in cross_sections.xml, by default select the
     // directory in which the cross_sections.xml file resides
     auto pos = filename.rfind("/");
+    if (pos == std::string::npos) {
+      // no '/' found, probably a Windows directory
+      pos = filename.rfind("\\");
+    }
     directory = filename.substr(0, pos);
   }
 
