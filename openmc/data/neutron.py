@@ -85,7 +85,7 @@ class IncidentNeutron(EqualityMixin):
     resonance_covariance : openmc.data.ResonanceCovariance or None
         Covariance for resonance parameters
     temperatures : list of str
-        List of string representations the temperatures of the target nuclide
+        List of string representations of the temperatures of the target nuclide
         in the data set.  The temperatures are strings of the temperature,
         rounded to the nearest integer; e.g., '294K'
     kTs : Iterable of float
@@ -118,7 +118,12 @@ class IncidentNeutron(EqualityMixin):
         if mt in self.reactions:
             return self.reactions[mt]
         else:
-            raise KeyError('No reaction with MT={}.'.format(mt))
+            # Try to create a redundant cross section
+            mts = self.get_reaction_components(mt)
+            if len(mts) > 0:
+                return self._get_redundant_reaction(mt, mts)
+            else:
+                raise KeyError('No reaction with MT={}.'.format(mt))
 
     def __repr__(self):
         return "<IncidentNeutron: {}>".format(self.name)
@@ -405,7 +410,7 @@ class IncidentNeutron(EqualityMixin):
         ----------
         path : str
             Path to write HDF5 file to
-        mode : {'r', r+', 'w', 'x', 'a'}
+        mode : {'r', 'r+', 'w', 'x', 'a'}
             Mode that is used to open the HDF5 file. This is the second argument
             to the :class:`h5py.File` constructor.
         libver : {'earliest', 'latest'}
@@ -911,16 +916,17 @@ class IncidentNeutron(EqualityMixin):
             Redundant reaction
 
         """
-        # Get energy grid
-        strT = self.temperatures[0]
-        energy = self.energy[strT]
 
         rx = Reaction(mt)
-        xss = [self.reactions[mt_i].xs[strT] for mt_i in mts]
-        idx = min([xs._threshold_idx if hasattr(xs, '_threshold_idx')
-                   else 0 for xs in xss])
-        rx.xs[strT] = Tabulated1D(energy[idx:], Sum(xss)(energy[idx:]))
-        rx.xs[strT]._threshold_idx = idx
+        # Get energy grid
+        for strT in self.temperatures:
+            energy = self.energy[strT]
+            xss = [self.reactions[mt_i].xs[strT] for mt_i in mts]
+            idx = min([xs._threshold_idx if hasattr(xs, '_threshold_idx')
+                       else 0 for xs in xss])
+            rx.xs[strT] = Tabulated1D(energy[idx:], Sum(xss)(energy[idx:]))
+            rx.xs[strT]._threshold_idx = idx
+
         rx.redundant = True
 
         return rx

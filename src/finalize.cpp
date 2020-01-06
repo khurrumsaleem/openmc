@@ -44,7 +44,9 @@ void free_memory()
   free_memory_mesh();
   free_memory_tally();
   free_memory_bank();
-  free_memory_cmfd();
+  if (mpi::master) {
+    free_memory_cmfd();
+  }
 #ifdef DAGMC
   free_memory_dagmc();
 #endif
@@ -135,6 +137,10 @@ int openmc_finalize()
 
 int openmc_reset()
 {
+
+  model::universe_cell_counts.clear();
+  model::universe_level_counts.clear();
+
   for (auto& t : model::tallies) {
     t->reset();
   }
